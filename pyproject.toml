@@ -1,0 +1,31 @@
+[project]
+name = "rainpro"
+version = "0.1.0"
+description = "Official implementation of RainPro-8"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops>=0.8.2",
+    "h5py>=3.16.0",
+    "ipykernel>=6.29.5",
+    "jsonargparse[signatures]>=4.27.7",
+    "lightning>=2.6.1",
+    "matplotlib>=3.10.8",
+    "pandas>=3.0.2",
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+    "wandb[media]>=0.25.1",
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu126" },
+]
+torchvision = [
+  { index = "pytorch-cu126" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
