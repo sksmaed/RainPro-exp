@@ -33,7 +33,7 @@ This loads the model from the specified checkpoint and evaluates it on the test 
 Checkpoints and precomputed thresholds are available in [Google Drive](https://drive.google.com/drive/folders/1Vfv7arDCNUL3oKVS_n0wsoFy7ELHTlGp?usp=sharing). Download and place them in: `runs/<run_name>/checkpoints/`
 
 ## RainPro-8 (Architecture)
-Coming soon!
+The RainPro-8 architecture, which leverages multi-source data, is implemented in `rainpro/network/rainpro8.py`. A demonstration notebook showcasing its usage is also provided (`rainpro8.ipynb`).
 
 ## Citation
 If you find our work useful for your research, please cite our [paper](https://arxiv.org/abs/2505.10271):
