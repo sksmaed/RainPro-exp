@@ -228,11 +228,17 @@ class RainPro(nn.Module):
         stochastic_depth_prob: float = 0.2,
         dropout: float = 0.1,
         resnet_depth: int = 2,
+        buckets_fn: Callable = _sevir_buckets,
     ):
         super().__init__()
         self.T_out = T_out
         in_dim_4km, in_dim_8km, in_dim_16km = in_dims
         dim_4km, dim_8km, dim_16km, dim_2km = dims
+        # A 16km-tier source (e.g. GFS) is optional: with `in_dim_16km == 0`
+        # (no such source configured, see `rainpro8_sources.build_taiwan_sources`),
+        # the encoder skips that branch entirely instead of embedding a 0-channel
+        # input.
+        self.has_16km = in_dim_16km > 0
 
         self.target_crop_4km = Unpad(skip_padding_4km)
         self.skip_crop_4km = Unpad(context_size_4km - skip_padding_4km)
@@ -240,7 +246,7 @@ class RainPro(nn.Module):
         self.skip_crop_16km = Unpad((context_size_8km - skip_padding_4km // 2) // 2)
         self.pad_to_8km = Pad(context_size_8km - context_size_4km // 2)
 
-        self.buckets = _sevir_buckets()
+        self.buckets = buckets_fn()
         self.thresholds = Threshold(
             self.buckets,
             0.5,
@@ -263,12 +269,15 @@ class RainPro(nn.Module):
             dim_out=in_dim_8km,
             attention=False,
         )
-        self.clt_16km = LeadTimeConditioning(
-            hot_enc_dim=self.T_out,
-            cond_dim=cond_dim,
-            dim_out=in_dim_16km,
-            attention=False,
-        )
+        if self.has_16km:
+            self.clt_16km = LeadTimeConditioning(
+                hot_enc_dim=self.T_out,
+                cond_dim=cond_dim,
+                dim_out=in_dim_16km,
+                attention=False,
+            )
+            self.embed_16km = Block(in_dim_16km, dim_16km, norm, kernel_size=1)
+        maxvit_in_channels = dim_8km + dim_16km if self.has_16km else dim_8km
 
         self.embed_4km = Block(in_dim_4km, dim_4km, norm, kernel_size=1)
         self.down_4km_to_8km = DownConvBlock(
@@ -288,9 +297,8 @@ class RainPro(nn.Module):
             dropout=dropout,
         )
 
-        self.embed_16km = Block(in_dim_16km, dim_16km, norm, kernel_size=1)
         self.maxvit_input = ResNetBlocks(
-            in_channels=dim_8km + dim_16km,
+            in_channels=maxvit_in_channels,
             out_channels=dim_16km,
             norm_layer=norm,
             depth=resnet_depth,
@@ -340,12 +348,11 @@ class RainPro(nn.Module):
         self,
         x_4km: Tensor,
         x_8km: Tensor,
-        x_16km: Tensor,
+        x_16km: Optional[Tensor],
         cond: Tensor,
     ):
         x_4km = self.clt_4km(x_4km, cond)
         x_8km = self.clt_8km(x_8km, cond)
-        x_16km = self.clt_16km(x_16km, cond)
 
         # 4 km
         x = self.embed_4km(x_4km, cond=cond)
@@ -358,8 +365,11 @@ class RainPro(nn.Module):
         skip_8km = self.skip_crop_8km(x)
         x = self.down_8km_to_16km(x, cond=cond)
 
-        # 16 km
-        x = torch.cat([x, self.embed_16km(x_16km, cond=cond)], dim=1)
+        # 16 km (optional: only present when a 16km-tier source, e.g. GFS, is
+        # configured -- see `self.has_16km`)
+        if self.has_16km:
+            x_16km = self.clt_16km(x_16km, cond)
+            x = torch.cat([x, self.embed_16km(x_16km, cond=cond)], dim=1)
         x = self.maxvit_input(x, cond=cond)
         x = self.maxvit(x, cond=cond)
         x = self.skip_crop_16km(x)
@@ -383,7 +393,7 @@ class RainPro(nn.Module):
         self,
         x_4km: Tensor,  # B (TC) H W
         x_8km: Tensor,  # B (T'C') H' W'
-        x_16km: Tensor,  # B (T''C'') H'' W''
+        x_16km: Optional[Tensor] = None,  # B (T''C'') H'' W'', absent when has_16km=False
     ) -> Tensor:
         b = x_4km.shape[0]
         cond = F.one_hot(
@@ -399,7 +409,7 @@ class RainPro(nn.Module):
         self,
         x_4km: torch.Tensor,
         x_8km: torch.Tensor,
-        x_16km: torch.Tensor,
+        x_16km: torch.Tensor | None,
         target: torch.Tensor | None,
         eval_request: EvalRequest,
     ) -> EvalOutputs | torch.Tensor:

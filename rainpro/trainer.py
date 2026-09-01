@@ -20,6 +20,7 @@ class RainProTrainer(pl.Trainer):
         root_dir: str = "runs",
         project: str = "rainpro",
         num_animations: int | None = 20,
+        animation_bounds: list[float] | None = None,
         callbacks: list[pl.Callback] | pl.Callback | None = None,
         **kwargs,
     ):
@@ -29,6 +30,7 @@ class RainProTrainer(pl.Trainer):
             os.path.join(root_dir, run_name, "checkpoints"),
             early_stopping_patience,
             num_animations,
+            animation_bounds,
         )
 
         super().__init__(

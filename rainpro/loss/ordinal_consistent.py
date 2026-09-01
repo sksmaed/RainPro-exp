@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import numpy as np
 import torch
@@ -27,6 +27,26 @@ def _sevir_buckets(normalize: bool = True):
     for t in thresholds:
         size = (t - prev) / normalize_factor
         buckets.append(Bucket(min=t / normalize_factor, size=size))
+        prev = t
+    return buckets
+
+
+def taiwan_buckets(normalize: bool = False):
+    """Precipitation intensity classes (mm/h) used for RainPro-8, App. E of the paper.
+
+    Unlike `_sevir_buckets` (raw 8-bit VIL codes), targets here are already in mm/h
+    (QPESUMS max dBZ converted via Marshall-Palmer, see `rainpro.data.marshall_palmer`),
+    so `normalize` is a no-op kept only for interface parity with `_sevir_buckets`.
+    """
+    del normalize
+    thresholds = [
+        0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 3.0, 4.0, 5.0,
+        6.0, 7.0, 8.0, 9.0, 10.0, 15.0, 20.0, 25.0,
+    ]
+    buckets = []
+    prev = 0.0
+    for t in thresholds:
+        buckets.append(Bucket(min=t, size=t - prev))
         prev = t
     return buckets
 
@@ -87,13 +107,14 @@ class OrdinalConsistentLoss(torch.nn.Module):
         no_data_value: int,
         t_size: int,
         ratio: int = 2,
+        buckets_fn: Callable = _sevir_buckets,
     ) -> None:
         super().__init__()
         self.no_data_value = no_data_value
         self.criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
         range_tensor = torch.arange(no_data_value).view(1, 1, no_data_value, 1, 1)
 
-        self.bucketize = Bucketize(_sevir_buckets())
+        self.bucketize = Bucketize(buckets_fn())
         self.register_buffer("range_tensor", range_tensor)
 
         decay_rate = np.log(ratio) / (t_size - 1)

@@ -13,6 +13,7 @@ def create_callbacks(
     ckpt_path: str,
     early_stopping_patience: int | None,
     num_animations: int | None,
+    animation_bounds: list[float] | None = None,
 ) -> list[Callback]:
     callbacks = [
         LogPlots(),
@@ -31,7 +32,7 @@ def create_callbacks(
 
     if num_animations is not None and num_animations > 0:
         callbacks.append(
-            LogAnimations(num_animations=num_animations),
+            LogAnimations(num_animations=num_animations, bounds=animation_bounds),
         )
 
     if early_stopping_patience is not None:

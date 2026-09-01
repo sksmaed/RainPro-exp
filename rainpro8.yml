@@ -1,0 +1,48 @@
+# RainPro-8 (Taiwan): QPESUMS + STA_H8 obs-only baseline, with GFS available
+# as an optional input behind `--data.include_gfs` -- see
+# rainpro/data/rainpro8_sources.py.
+#
+# Usage:
+#   python main_rainpro8.py fit <run_name> --config rainpro8.yml \
+#       --data.data_root.qpesums <path> --data.data_root.sta_h8 <path>
+#
+# To include GFS, add `--data.include_gfs true --data.data_root.gfs <path>
+# --data.data_root.gfs_forecast <path>` (and `--data.gfs_variables [...]`).
+
+trainer:
+  precision: '32'
+  gradient_clip_val: 1.0
+  max_epochs: 50 # paper trains for 100k steps (batch_size=16); tune to your dataset size
+  log_every_n_steps: 50
+  project: rainpro8_tw
+  devices: [0]
+  num_animations: 20
+
+model:
+  class_path: rainpro.modules.rainpro8.RainPro8Module
+  init_args:
+    lead_time_decay_ratio: 10.0
+    learning_rate: 3.0e-4
+    weight_decay: 0.1
+    dropout: 0.1
+    stochastic_depth_prob: 0.2
+
+data:
+  include_gfs: false # set true (+ data_root.gfs / gfs_forecast) to add GFS as a 16km-tier input
+  data_root:
+    qpesums: # path to QPESUMS zarr store (max dBZ)
+    sta_h8: # path to STA_H8 zarr store (9 IR bands)
+    # gfs: # path to GFS zarr store, only needed when include_gfs=true
+    # gfs_forecast: # path to GFS forecast zarr store, only needed when include_gfs=true
+  start_date: 2023-12-01
+  end_date: 2024-11-30
+  cycle_train_days: 12
+  cycle_val_days: 2
+  cycle_test_days: 2
+  cycle_blackout_hours: 12
+  center_lat: 23.7
+  center_lon: 121.0
+  train_jitter_km: 256
+  batch_size: 16
+  eval_batch_size: 16
+  num_workers: 16

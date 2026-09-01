@@ -1,3 +1,5 @@
+from typing import Callable
+
 import torch
 from einops import rearrange, repeat
 from lightning import Callback, LightningModule, Trainer
@@ -14,10 +16,11 @@ class OptimalThresholds(Callback):
         self,
         output_dir,
         threshold_module: Threshold,
+        buckets_fn: Callable = _sevir_buckets,
     ):
         super().__init__()
         self.output_dir = output_dir
-        self.buckets = _sevir_buckets(normalize=False)
+        self.buckets = buckets_fn(normalize=False)
         self.n_lead_times = threshold_module.thresholds.size(1)
 
     def on_predict_start(self, trainer, pl_module):

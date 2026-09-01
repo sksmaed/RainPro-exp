@@ -13,12 +13,18 @@ from rainpro.modules.utils import EvalOutputs
 
 
 class LogAnimations(L.Callback):
-    def __init__(self, num_animations: int):
+    def __init__(
+        self,
+        num_animations: int,
+        bounds: list[float] | None = None,
+        min_interesting_value: float = 160,
+        min_interesting_count: int = 10,
+    ):
         super().__init__()
         self.num_animations = num_animations
-        self.cmap, self.norm = _vil_cmap()
-        self.min_interesting_value = 160
-        self.min_interesting_count = 10
+        self.cmap, self.norm = _precip_cmap(bounds) if bounds else _vil_cmap()
+        self.min_interesting_value = min_interesting_value
+        self.min_interesting_count = min_interesting_count
         self.animations: list[Tensor] = []
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, *args, **kwargs):
@@ -130,5 +136,12 @@ def _vil_cmap():
     ]
 
     cmap = mpl.colors.ListedColormap(color_map)
+    norm = mpl.colors.BoundaryNorm(bounds, cmap.N)
+    return cmap, norm
+
+
+def _precip_cmap(bounds: list[float]):
+    """Generic precipitation-intensity colormap for arbitrary (e.g. mm/h) bounds."""
+    cmap = mpl.colormaps["turbo"].resampled(len(bounds) - 1)
     norm = mpl.colors.BoundaryNorm(bounds, cmap.N)
     return cmap, norm
