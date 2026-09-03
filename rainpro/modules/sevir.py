@@ -23,7 +23,13 @@ class SEVIRModule(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters(ignore="data")
-        self.total_steps = max_epochs * len(data.train_dataloader())
+        # `total_steps` is only needed by the LR scheduler in `configure_optimizers`,
+        # which Lightning never calls for a test/predict-only run. Keep `data` and
+        # compute it lazily there instead of eagerly here, so `test` doesn't have to
+        # build the train dataloader (and thus open every h5 file referenced by the
+        # train split) just to construct this module.
+        self.data = data
+        self.max_epochs = max_epochs
 
         self.frames_in = frames_in
         self.frames_out = frames_out
@@ -142,10 +148,11 @@ class SEVIRModule(L.LightningModule):
             weight_decay=0.0,
         )
 
+        total_steps = self.max_epochs * len(self.data.train_dataloader())
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=1000,
-            num_training_steps=self.total_steps,
+            num_training_steps=total_steps,
         )
 
         return {

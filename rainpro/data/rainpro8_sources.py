@@ -11,7 +11,7 @@ European layout this mirrors):
 | target_2km              | QPESUMS max dBZ           | 2 km       | Marshall-Palmer -> mm/h |
 | radar_4km                | QPESUMS (downsampled)     | 4 km       | -60..0 min |
 | radar_8km                | QPESUMS (downsampled)     | 8 km       | t=0 |
-| satellite_8km             | STA_H8 (9 IR bands)       | 8 km       | -120..-60 min |
+| satellite_8km             | STA_H8 (9 IR bands)       | 8 km       | -120..-60 min @ 10 min |
 | "16km" tier (NWP, optional) | GFS (`include_gfs=True`) | -> 16 km   | see below |
 |                              | GFS forecast (`include_gfs=True`)| -> 16 km | +60..+480 min |
 
@@ -41,6 +41,62 @@ Tier = str  # "target_2km" | "4km" | "8km" | "16km"
 
 STA_H8_BANDS = [f"B{i:02d}" for i in range(8, 17)]  # B08..B16, 9 IR bands
 
+# Paper App. I (Table 11): the 122 `gfs_16km` channels kept from the full GFS
+# field set, flattened to one canonical name per (variable, level) pair --
+# e.g. "TMP_850mb", "TMP_surface" -- with bare GRIB2 codes (e.g. "PRATE") for
+# variables that only have a single level in Table 11. These are canonical
+# names, not necessarily the raw GFS zarr store's own field names; map real
+# names onto them via `variable_aliases` (see `RainPro8Dataset`) if the store
+# uses different conventions (e.g. no per-level suffix, different level units).
+GFS_ANALYSIS_VARIABLES: tuple[str, ...] = (
+    "4LFTX",
+    *(f"ABSV_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb")),
+    *(f"CAPE_{lvl}" for lvl in ("surface", "180-0mb", "90-0mb", "255-0mb")),
+    "CFRZR",
+    "CICEP",
+    *(f"CIN_{lvl}" for lvl in ("surface", "180-0mb", "90-0mb", "255-0mb")),
+    *(f"CLMR_{lvl}" for lvl in ("250mb", "500mb", "850mb", "1000mb")),
+    "CPOFP",
+    "CRAIN",
+    "CSNOW",
+    "CWAT",
+    "DPT",
+    *(f"DZDT_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb")),
+    *(f"GRLE_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb")),
+    "GUST",
+    *(f"HGT_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb", "surface", "trop")),
+    "HPBL",
+    "ICEG",
+    "ICETK",
+    *(f"ICMR_{lvl}" for lvl in ("250mb", "500mb", "850mb", "1000mb")),
+    "LCDC",
+    "LFTX",
+    "MCDC",
+    "MSLET",
+    "PLPL",
+    "PRATE",
+    *(f"PRES_{lvl}" for lvl in ("surface", "trop")),
+    "PRMSL",
+    "PWAT",
+    "REFC",
+    *(f"RH_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb", "2m", "atm")),
+    *(f"RWMR_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb")),
+    *(f"SNMR_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb")),
+    "SNOD",
+    *(f"SPFH_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb", "2m")),
+    *(f"TCDC_{lvl}" for lvl in ("250mb", "500mb", "850mb", "1000mb", "atm")),
+    *(f"TMP_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb", "surface", "2m", "trop")),
+    *(f"UGRD_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb", "10m", "trop")),
+    "USTM",
+    *(f"VGRD_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb", "10m", "trop")),
+    "VIS",
+    "VSTM",
+    *(f"VVEL_{lvl}" for lvl in ("100mb", "250mb", "500mb", "850mb", "1000mb")),
+    "VWSH",
+    "WEASD",
+)
+assert len(GFS_ANALYSIS_VARIABLES) == 122
+
 
 @dataclass(frozen=True)
 class SourceSpec:
@@ -69,7 +125,7 @@ class SourceSpec:
 
 def build_taiwan_sources(
     include_gfs: bool = False,
-    gfs_variables: Sequence[str] = (),
+    gfs_variables: Sequence[str] = GFS_ANALYSIS_VARIABLES,
     gfs_forecast_variables: Sequence[str] = ("PRATE",),
 ) -> dict[str, SourceSpec]:
     """Build the Taiwan RainPro-8 source spec dict, keyed like the model's `sources`.
@@ -79,10 +135,16 @@ def build_taiwan_sources(
     tier at all -- only QPESUMS (target/radar) and STA_H8 (satellite) feed the
     model.
 
-    `gfs_variables`/`gfs_forecast_variables` are configurable so the exact
-    channel count can be tuned per `docs/rainpro_dataset.md` without code
-    changes -- mirrors how the paper only keeps 122 of the available GFS
-    channels (App. I).
+    `gfs_variables` defaults to `GFS_ANALYSIS_VARIABLES`, the paper's 122-channel
+    App. I selection (see that constant's docstring re: `variable_aliases` if
+    the real GFS store names fields differently). Pass a different sequence
+    (or `()`) to override -- `gfs_variables`/`gfs_forecast_variables` stay
+    configurable so the exact channel count can be tuned without code changes.
+
+    `satellite_8km` samples every 10 min (7 steps) rather than the paper's
+    15 min/5-step EUMETSAT cadence: STA_H8 is a native 10-minute product,
+    unlike EUMETSAT's ~1h-delayed feed that motivated the paper's coarser,
+    -60min-starting window (Sec. A.2).
     """
     sources: dict[str, SourceSpec] = {
         "target_2km": SourceSpec(
@@ -114,7 +176,7 @@ def build_taiwan_sources(
             tier="8km",
             resolution_km=8,
             size_km=1536,
-            offsets_min=tuple(range(-120, -45, 15)),  # -120..-60 min, 5 steps
+            offsets_min=tuple(range(-120, -50, 10)),  # -120..-60 min @ 10 min, 7 steps
             variables=tuple(STA_H8_BANDS),
         ),
     }
@@ -125,7 +187,8 @@ def build_taiwan_sources(
 
             warnings.warn(
                 "include_gfs=True but gfs_variables is empty -- gfs_16km will have 0 "
-                "channels. Pass `gfs_variables` (see paper App. I) to actually use it.",
+                "channels. Pass `gfs_variables` (defaults to `GFS_ANALYSIS_VARIABLES`, "
+                "see paper App. I) to actually use it.",
                 stacklevel=2,
             )
         sources["gfs_16km"] = SourceSpec(

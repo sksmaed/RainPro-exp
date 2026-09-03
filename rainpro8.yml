@@ -7,7 +7,11 @@
 #       --data.data_root.qpesums <path> --data.data_root.sta_h8 <path>
 #
 # To include GFS, add `--data.include_gfs true --data.data_root.gfs <path>
-# --data.data_root.gfs_forecast <path>` (and `--data.gfs_variables [...]`).
+# --data.data_root.gfs_forecast <path>`. `data.gfs_variables` defaults to the
+# paper's 122-channel App. I selection (`GFS_ANALYSIS_VARIABLES` in
+# rainpro/data/rainpro8_sources.py); pass `--data.gfs_variables [...]` only to
+# override it, and `--data.variable_aliases {...}` if the real GFS zarr store
+# names fields differently than those canonical names.
 
 trainer:
   precision: '32'

@@ -7,7 +7,8 @@
 | QPESUMS max dBZ | target_2km (0 - 6h) | 384 × 512 km / 2 km | 10 min |
 | QPESUMS downsampling | radar_4km (−60…0 min) | 565 × 780 km / 4 km | 10 min |
 | QPESUMS downsampling | radar_8km (0 min) | 565 × 780 km / 8 km | - |
-| STA_H8 | satellite_8km (−120…−60 min） | 1536 × 1536 km / 8 km | 15 min |
+| STA_H8 | satellite_8km (−120…−60 min） | 1536 × 1536 km / 8 km | 10 min |
+| GFS（`include_gfs=True` 時，選用） | gfs_16km (0 min, 122 channels) + gfs_forecast_16km (+60…+480 min, PRATE) | 1536 × 1536 km / 16 km | gfs_16km: 每日 4 次；gfs_forecast_16km: 逐小時 lead time |
 
 ## 資料集描述
 
@@ -24,9 +25,17 @@
 
 - 型態：衛星（靜止軌道）
 - 來源性質：觀測
-- 時間解析度：一小時
+- 時間解析度：10 分鐘
 - 空間解析度 / 網格：2750 × 2750 LCC grid（STA_H8_Plt_IR_for_glbdisplay 有逐像素經緯度查找表）
 - 欄位：9 個紅外線波段（B08 - B16）亮溫
+
+### GFS（選用，`include_gfs=True`）
+
+- 型態：NWP 數值模式
+- 來源性質：分析場（gfs_16km）+ 預報場（gfs_forecast_16km，僅 PRATE）
+- 時間解析度：分析場每日 4 次初始化；預報場逐小時 lead time（+60…+480 min）
+- 空間解析度 / 網格：16 km（原生 ~28 km，upsample 至 16 km）
+- 欄位：122 個 channel，對應原論文 App. I（Table 11）選出的 GFS 變數 × 氣壓層組合，完整清單見 `GFS_ANALYSIS_VARIABLES`（`rainpro/data/rainpro8_sources.py`），命名規則為 `VAR` 或 `VAR_層別`（如 `TMP_850mb`、`TMP_surface`）；若實際 GFS zarr store 的欄位命名不同，需透過 `variable_aliases`（`RainPro8Dataset`）對應
 
 ## 預計壓縮策略
 

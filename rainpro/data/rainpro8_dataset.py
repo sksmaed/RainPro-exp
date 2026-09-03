@@ -44,7 +44,7 @@ TIME_TOLERANCE = {
     "target_2km": "5min",
     "radar_4km": "5min",
     "radar_8km": "5min",
-    "satellite_8km": "8min",
+    "satellite_8km": "5min",
     "gfs_16km": "3h",
     "gfs_forecast_16km": "31min",
 }

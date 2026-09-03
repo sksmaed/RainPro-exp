@@ -13,7 +13,7 @@ from lightning.pytorch import LightningDataModule
 from torch.utils.data import DataLoader
 
 from rainpro.data.rainpro8_dataset import RainPro8Dataset
-from rainpro.data.rainpro8_sources import SourceSpec, build_taiwan_sources
+from rainpro.data.rainpro8_sources import GFS_ANALYSIS_VARIABLES, SourceSpec, build_taiwan_sources
 
 
 def cycle_split(
@@ -80,7 +80,7 @@ class RainPro8DataModule(LightningDataModule):
         norm_bounds: dict[str, tuple[float, float]] | None = None,
         variable_aliases: dict[str, str] | None = None,
         latlon_names: dict[str, tuple[str, str]] | None = None,
-        gfs_variables: tuple[str, ...] = (),
+        gfs_variables: tuple[str, ...] = GFS_ANALYSIS_VARIABLES,
         gfs_forecast_variables: tuple[str, ...] = ("PRATE",),
     ):
         super().__init__()
