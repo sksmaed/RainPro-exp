@@ -12,6 +12,9 @@
 # rainpro/data/rainpro8_sources.py); pass `--data.gfs_variables [...]` only to
 # override it, and `--data.variable_aliases {...}` if the real GFS zarr store
 # names fields differently than those canonical names.
+#
+# For a radar-only ablation arm, add `--data.include_satellite false` (QPESUMS
+# stays; only STA_H8 drops out -- `data_root.sta_h8` becomes unused).
 
 trainer:
   precision: '32'
@@ -32,6 +35,7 @@ model:
     stochastic_depth_prob: 0.2
 
 data:
+  include_satellite: true # set false to drop STA_H8 for a radar-only (QPESUMS-only) ablation arm
   include_gfs: false # set true (+ data_root.gfs / gfs_forecast) to add GFS as a 16km-tier input
   data_root:
     qpesums: # path to QPESUMS zarr store (max dBZ)

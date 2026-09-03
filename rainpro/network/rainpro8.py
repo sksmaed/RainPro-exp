@@ -1,5 +1,5 @@
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -37,7 +37,7 @@ class Block(nn.Module):
         self.norm = norm_layer(num_channels=out_channels, attention=False)
         self.activation = activation
 
-    def forward(self, x: Tensor, cond: Optional[Tensor]) -> Tensor:
+    def forward(self, x: Tensor, cond: Tensor | None) -> Tensor:
         x = self.conv(x)
         x = self.norm(x, cond)
         return self.activation(x)
@@ -73,7 +73,7 @@ class ResNetBlock(nn.Module):
         self.activation = activation
         self.dropout = nn.Dropout2d(p=dropout)
 
-    def forward(self, x: Tensor, cond: Optional[Tensor]) -> Tensor:
+    def forward(self, x: Tensor, cond: Tensor | None) -> Tensor:
         h = self.dropout(self.block1(x, cond))
         h = self.dropout(self.block2(h, cond))
         return self.activation(h + self.residual_conv(x))
@@ -100,7 +100,7 @@ class ResNetBlocks(nn.Module):
         ]
         self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, x: Tensor, cond: Optional[Tensor]) -> Tensor:
+    def forward(self, x: Tensor, cond: Tensor | None) -> Tensor:
         for block in self.blocks:
             x = block(x, cond)
         return x
@@ -136,7 +136,7 @@ class DownConvBlock(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: Tensor, cond: Optional[Tensor]) -> Tensor:
+    def forward(self, x: Tensor, cond: Tensor | None) -> Tensor:
         x = self.down(x)
         x = self.blocks(x, cond)
         return x
@@ -149,7 +149,7 @@ class UpConvBlock(nn.Module):
         out_channels: int,
         norm_layer: Callable[..., nn.Module],
         dropout: float,
-        skip_channels: Optional[int] = None,
+        skip_channels: int | None = None,
         depth: int = 2,
     ):
         super().__init__()
@@ -165,8 +165,8 @@ class UpConvBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        cond: Optional[Tensor],
-        skip: Optional[Tensor] = None,
+        cond: Tensor | None,
+        skip: Tensor | None = None,
     ) -> Tensor:
         x = self.up(x)
         if skip is not None:
@@ -242,7 +242,7 @@ class RainPro(nn.Module):
 
         self.target_crop_4km = Unpad(skip_padding_4km)
         self.skip_crop_4km = Unpad(context_size_4km - skip_padding_4km)
-        self.skip_crop_8km = Unpad((context_size_8km - skip_padding_4km // 2))
+        self.skip_crop_8km = Unpad(context_size_8km - skip_padding_4km // 2)
         self.skip_crop_16km = Unpad((context_size_8km - skip_padding_4km // 2) // 2)
         self.pad_to_8km = Pad(context_size_8km - context_size_4km // 2)
 
@@ -348,7 +348,7 @@ class RainPro(nn.Module):
         self,
         x_4km: Tensor,
         x_8km: Tensor,
-        x_16km: Optional[Tensor],
+        x_16km: Tensor | None,
         cond: Tensor,
     ):
         x_4km = self.clt_4km(x_4km, cond)
@@ -393,7 +393,7 @@ class RainPro(nn.Module):
         self,
         x_4km: Tensor,  # B (TC) H W
         x_8km: Tensor,  # B (T'C') H' W'
-        x_16km: Optional[Tensor] = None,  # B (T''C'') H'' W'', absent when has_16km=False
+        x_16km: Tensor | None = None,  # B (T''C'') H'' W'', absent when has_16km=False
     ) -> Tensor:
         b = x_4km.shape[0]
         cond = F.one_hot(

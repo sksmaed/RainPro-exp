@@ -8,18 +8,22 @@ European layout this mirrors):
 
 | role (RainPro-8 tier) | Taiwan source            | resolution | notes |
 | ---------------------- | ------------------------- | ---------- | ----- |
-| target_2km              | QPESUMS max dBZ           | 2 km       | Marshall-Palmer -> mm/h |
+| target_2km              | QPESUMS max dBZ           | 2 km       | raw dBZ (no mm/h conversion in the data path, see `docs/rainpro_tw_implementation_notes.md`) |
 | radar_4km                | QPESUMS (downsampled)     | 4 km       | -60..0 min |
 | radar_8km                | QPESUMS (downsampled)     | 8 km       | t=0 |
-| satellite_8km             | STA_H8 (9 IR bands)       | 8 km       | -120..-60 min @ 10 min |
+| satellite_8km (optional)  | STA_H8 (9 IR bands, `include_satellite=True`) | 8 km | -120..-60 min @ 10 min |
 | "16km" tier (NWP, optional) | GFS (`include_gfs=True`) | -> 16 km   | see below |
 |                              | GFS forecast (`include_gfs=True`)| -> 16 km | +60..+480 min |
 
-This is deliberately the smallest obs-only baseline (QPESUMS + STA_H8) plus a
-single on/off switch for GFS, to compare the two arms directly before adding
-any other source. When `include_gfs=False`, there is no 16 km tier at all;
-`rainpro.network.rainpro8.RainPro` (via `in_dims`, see `tier_channels` below)
-handles a 0-channel/absent 16 km tier by skipping that branch of the encoder.
+This is deliberately the smallest obs-only baseline (QPESUMS + STA_H8) plus
+on/off switches for STA_H8 and GFS, to compare arms (radar-only / obs-only /
+obs+GFS) directly before adding any other source. When `include_gfs=False`,
+there is no 16 km tier at all; `rainpro.network.rainpro8.RainPro` (via
+`in_dims`, see `tier_channels` below) handles a 0-channel/absent 16 km tier by
+skipping that branch of the encoder. `include_satellite=False` instead just
+shrinks the 8 km tier's channel count (`radar_8km` stays, since it shares that
+tier with `satellite_8km`) -- the 8 km branch has no such zero-channel
+skip-logic to begin with, so it needs none added.
 
 Spatial canvas sizes (target 512 km, radar_4km context 1024 km, 8km/16km-tier
 context 1536 km) intentionally reuse the exact geometry of the original
@@ -124,6 +128,7 @@ class SourceSpec:
 
 
 def build_taiwan_sources(
+    include_satellite: bool = True,
     include_gfs: bool = False,
     gfs_variables: Sequence[str] = GFS_ANALYSIS_VARIABLES,
     gfs_forecast_variables: Sequence[str] = ("PRATE",),
@@ -134,6 +139,12 @@ def build_taiwan_sources(
     fills the 16 km tier. When `False` (the obs-only arm), there is no 16 km
     tier at all -- only QPESUMS (target/radar) and STA_H8 (satellite) feed the
     model.
+
+    `include_satellite` toggles STA_H8 (`satellite_8km`), for a radar-only
+    ablation arm. Unlike `include_gfs`, this does *not* zero out a whole tier:
+    `radar_8km` (QPESUMS) shares `tier="8km"` with `satellite_8km`, so turning
+    satellite off still leaves `radar_8km` feeding the 8km branch (with a
+    smaller channel count) rather than removing that tier entirely.
 
     `gfs_variables` defaults to `GFS_ANALYSIS_VARIABLES`, the paper's 122-channel
     App. I selection (see that constant's docstring re: `variable_aliases` if
@@ -171,15 +182,17 @@ def build_taiwan_sources(
             offsets_min=(0,),
             variables=("max_dbz",),
         ),
-        "satellite_8km": SourceSpec(
+    }
+
+    if include_satellite:
+        sources["satellite_8km"] = SourceSpec(
             name="satellite_8km",
             tier="8km",
             resolution_km=8,
             size_km=1536,
             offsets_min=tuple(range(-120, -50, 10)),  # -120..-60 min @ 10 min, 7 steps
             variables=tuple(STA_H8_BANDS),
-        ),
-    }
+        )
 
     if include_gfs:
         if not gfs_variables:

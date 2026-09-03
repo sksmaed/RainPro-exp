@@ -4,5 +4,6 @@ wandb/
 .venv/
 __pycache__/
 data/
+checkpoints/
 uv.lock
 .DS_Store

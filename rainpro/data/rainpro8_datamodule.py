@@ -1,5 +1,6 @@
 """LightningDataModule for RainPro-8 (Taiwan): QPESUMS + STA_H8 obs-only baseline,
-with GFS available as an optional input behind `include_gfs` (see `rainpro8_sources.py`).
+with STA_H8 and GFS each togglable (`include_satellite`, `include_gfs`; see
+`rainpro8_sources.py`) for radar-only / obs-only / obs+GFS ablation arms.
 """
 
 from __future__ import annotations
@@ -66,6 +67,7 @@ class RainPro8DataModule(LightningDataModule):
         data_root: dict[str, str],
         start_date: datetime.datetime,
         end_date: datetime.datetime,
+        include_satellite: bool = True,
         include_gfs: bool = False,
         cycle_train_days: int = 12,
         cycle_val_days: int = 2,
@@ -87,6 +89,7 @@ class RainPro8DataModule(LightningDataModule):
         self.save_hyperparameters()
 
         self.data_root = data_root
+        self.include_satellite = include_satellite
         self.include_gfs = include_gfs
         self.center_lat = center_lat
         self.center_lon = center_lon
@@ -99,6 +102,7 @@ class RainPro8DataModule(LightningDataModule):
         self.latlon_names = latlon_names
 
         self.sources: dict[str, SourceSpec] = build_taiwan_sources(
+            include_satellite=include_satellite,
             include_gfs=include_gfs,
             gfs_variables=gfs_variables,
             gfs_forecast_variables=gfs_forecast_variables,

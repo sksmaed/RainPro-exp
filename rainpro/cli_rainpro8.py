@@ -5,7 +5,7 @@ from jsonargparse import ActionYesNo
 from lightning.pytorch.cli import LightningCLI
 
 from rainpro.data.rainpro8_datamodule import RainPro8DataModule
-from rainpro.loss.ordinal_consistent import taiwan_buckets
+from rainpro.loss.ordinal_consistent import taiwan_dbz_buckets
 from rainpro.network.optimal_threhsolds import OptimalThresholds
 from rainpro.trainer import RainProTrainer
 
@@ -42,7 +42,7 @@ class CLIRainPro8(LightningCLI):
                 OptimalThresholds(
                     output_dir=output_dir,
                     threshold_module=self.model.model.thresholds,
-                    buckets_fn=taiwan_buckets,
+                    buckets_fn=taiwan_dbz_buckets,
                 )
             )
 

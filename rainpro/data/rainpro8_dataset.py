@@ -25,7 +25,6 @@ import torch
 import xarray as xr
 from torch.utils.data import Dataset
 
-from rainpro.data.marshall_palmer import dbz_to_mmh
 from rainpro.data.normalize import DEFAULT_NORM_BOUNDS, minmax_normalize
 from rainpro.data.regrid import NearestNeighborRegridder, target_grid
 from rainpro.data.rainpro8_sources import SourceSpec
@@ -162,17 +161,23 @@ class RainPro8Dataset(Dataset):
             is_target = name == "target_2km"
             frames = [
                 self._read_frame(
-                    ds, regridder, spec, init_time, offset, dst_lat, dst_lon, keep_nan=is_target
+                    ds,
+                    regridder,
+                    spec,
+                    init_time,
+                    offset,
+                    dst_lat,
+                    dst_lon,
+                    keep_nan=is_target,
+                    normalize=not is_target,
                 )
                 for offset in spec.offsets_min
             ]
-            # (T, C, H, W)
+            # (T, C, H, W). GT is raw QPESUMS max dBZ (see
+            # docs/rainpro_tw_implementation_notes.md) -- no Marshall-Palmer
+            # conversion in the data path; `rainpro.data.marshall_palmer` is
+            # for post-hoc relabeling only (e.g. `rainpro.metrics.probabilistic.CRPS`).
             arr = np.stack(frames, axis=0)
-
-            if is_target:
-                arr = dbz_to_mmh(arr)  # keep NaN (missing) as NaN through the conversion;
-                # OrdinalConsistentLoss masks pixels equal to the NaN sentinel (see
-                # rainpro.loss.ordinal_consistent.Bucketize).
 
             sample[name] = torch.from_numpy(arr).float()
 
@@ -188,8 +193,22 @@ class RainPro8Dataset(Dataset):
         dst_lat: np.ndarray,
         dst_lon: np.ndarray,
         keep_nan: bool = False,
+        normalize: bool = True,
     ) -> np.ndarray:
-        """Returns (C, H, W) for one timestep of one source."""
+        """Returns (C, H, W) for one timestep of one source.
+
+        `normalize=False` (used for `target_2km`) bypasses `minmax_normalize`
+        entirely, regardless of whether the variable name happens to collide
+        with a `DEFAULT_NORM_BOUNDS`/`norm_bounds` key (`target_2km`'s
+        variable is `max_dbz`, which *is* in `DEFAULT_NORM_BOUNDS` for the
+        4km/8km radar input tiers) -- the target must stay in raw physical
+        units since it's compared against literal dBZ thresholds throughout
+        the loss/metrics pipeline, not fed to the network as a normalized
+        input feature. Without this, the target was silently squashed to
+        [0, 1] here and then (before this fix removed the mm/h conversion
+        entirely) run through `dbz_to_mmh` a second time on that already-
+        normalized value -- see `docs/rainpro_tw_implementation_notes.md`.
+        """
         all_vars = list(spec.variables) + list(spec.variables_3d)
         raw_names = [self.variable_aliases.get(v, v) for v in all_vars]
         # A source is "static" if none of its variables actually carry a time
@@ -213,7 +232,8 @@ class RainPro8Dataset(Dataset):
             raw_name = self.variable_aliases.get(var, var)
             data = np.asarray(frame_ds[raw_name].values, dtype=np.float32)
             regridded = regridder(data, dst_lat, dst_lon, fill_value=np.nan)
-            regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
+            if normalize:
+                regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
             channels.append(regridded)
 
         for var in spec.variables_3d:
@@ -221,7 +241,8 @@ class RainPro8Dataset(Dataset):
             data = np.asarray(frame_ds[raw_name].values, dtype=np.float32)  # (level, y, x)
             data = data[list(spec.levels)]
             regridded = regridder(data, dst_lat, dst_lon, fill_value=np.nan)
-            regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
+            if normalize:
+                regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
             channels.extend(regridded)
 
         out = np.stack(channels, axis=0)

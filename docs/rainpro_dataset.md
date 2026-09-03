@@ -7,7 +7,7 @@
 | QPESUMS max dBZ | target_2km (0 - 6h) | 384 × 512 km / 2 km | 10 min |
 | QPESUMS downsampling | radar_4km (−60…0 min) | 565 × 780 km / 4 km | 10 min |
 | QPESUMS downsampling | radar_8km (0 min) | 565 × 780 km / 8 km | - |
-| STA_H8 | satellite_8km (−120…−60 min） | 1536 × 1536 km / 8 km | 10 min |
+| STA_H8（`include_satellite=True` 時，選用） | satellite_8km (−120…−60 min） | 1536 × 1536 km / 8 km | 10 min |
 | GFS（`include_gfs=True` 時，選用） | gfs_16km (0 min, 122 channels) + gfs_forecast_16km (+60…+480 min, PRATE) | 1536 × 1536 km / 16 km | gfs_16km: 每日 4 次；gfs_forecast_16km: 逐小時 lead time |
 
 ## 資料集描述
@@ -21,7 +21,7 @@
 - 欄位：max dBZ、time、經緯度
 - 缺測值：-999 or -99
 
-### STA_H8
+### STA_H8（選用，`include_satellite=True`；關閉即為 radar-only 消融臂）
 
 - 型態：衛星（靜止軌道）
 - 來源性質：觀測

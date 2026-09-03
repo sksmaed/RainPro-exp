@@ -37,7 +37,7 @@ The RainPro-8 architecture, which leverages multi-source data, is implemented in
 
 ## RainPro-8 (Taiwan)
 
-This module trains/evaluates the RainPro-8 model on Taiwan data as an obs-only baseline: QPESUMS (radar) + STA_H8 (satellite). GFS is available as an optional additional input (`--data.include_gfs true`), to compare the obs-only arm against obs+GFS. See `docs/rainpro_dataset.md` for the source mapping.
+This module trains/evaluates the RainPro-8 model on Taiwan data as an obs-only baseline: QPESUMS (radar) + STA_H8 (satellite). Both STA_H8 and GFS are togglable inputs (`--data.include_satellite false` for a radar-only arm; `--data.include_gfs true` for obs+GFS), to compare radar-only / obs-only / obs+GFS arms. See `docs/rainpro_dataset.md` for the source mapping.
 
 Fill in the zarr store paths in `rainpro8.yml` (`data.data_root`), then:
 
@@ -59,6 +59,7 @@ Implementation notes / what still needs project-specific calibration before real
 - **Spatial regridding** (`rainpro/data/regrid.py`) is nearest-neighbor on a local equirectangular approximation, not a full geographic reprojection.
 - **Canvas geometry**: target/context sizes intentionally reuse the original European RainPro-8 geometry (`rainpro/data/rainpro8_sources.py`) since the network hard-assumes exact 2x relationships between resolution tiers; Taiwan's native (non-square, smaller) source coverage is embedded in these canvases with out-of-coverage pixels treated as missing.
 - **No 16km tier without GFS**: with `include_gfs=False` there is no 16km-tier source at all; `rainpro.network.rainpro8.RainPro` detects the 0-channel tier (`in_dims`) and skips that branch of the encoder rather than embedding an empty input.
+- **Radar-only ablation**: `--data.include_satellite false` drops STA_H8 but keeps `radar_8km` (QPESUMS) -- they share the 8km tier, so this shrinks that tier's channel count rather than removing it; no encoder changes needed since the 8km branch has no zero-channel skip logic to begin with (unlike the 16km tier above).
 
 ## Citation
 If you find our work useful for your research, please cite our [paper](https://arxiv.org/abs/2505.10271):

@@ -7,13 +7,21 @@ from torchmetrics import MetricCollection
 
 from rainpro.data.rainpro8_datamodule import RainPro8DataModule
 from rainpro.data.rainpro8_sources import context_sizes, tier_channels
-from rainpro.loss.ordinal_consistent import OrdinalConsistentLoss, taiwan_buckets
+from rainpro.loss.ordinal_consistent import OrdinalConsistentLoss, taiwan_dbz_buckets
+from rainpro.metrics.contingency import ContingencyMetrics
 from rainpro.metrics.csi import CriticalSuccessIndex
+from rainpro.metrics.fss import FractionsSkillScore
+from rainpro.metrics.probabilistic import CRPS, BrierScore, ReliabilityAccumulator
+from rainpro.metrics.regression import LeadTimeMAEMSE
 from rainpro.modules.utils import EvalOutputs, EvalRequest
 from rainpro.network.rainpro8 import RainPro, StackTimeAndChannels
 
-# Paper Table B.1 / Sec. 4.1 evaluation thresholds (mm/h).
-CSI_THRESHOLDS_MMH = [0.5, 1.0, 2.0, 5.0, 10.0]
+# GT is raw QPESUMS max dBZ (see `docs/rainpro_tw_implementation_notes.md`),
+# not the paper's mm/h-converted thresholds -- these are threshold metrics
+# (CSI/FSS/FBI/POD/FAR), invariant under the monotonic dBZ<->mm/h transform,
+# so the *choice* of evaluation intensities is what's preserved, not the
+# literal paper values.
+CSI_THRESHOLDS_DBZ = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0]
 
 
 def stack_sources(
@@ -69,7 +77,7 @@ class RainPro8Module(L.LightningModule):
             stochastic_depth_prob=stochastic_depth_prob,
             dropout=dropout,
             resnet_depth=resnet_depth,
-            buckets_fn=taiwan_buckets,
+            buckets_fn=taiwan_dbz_buckets,
         )
         # Paper Sec. 3.3 / Sec. 4: lead time weights use a decay *ratio* (first vs.
         # last weight); rebuild the criterion with the requested ratio (default 2
@@ -78,7 +86,7 @@ class RainPro8Module(L.LightningModule):
             self.model.out_channels,
             self.T_out,
             ratio=lead_time_decay_ratio,
-            buckets_fn=taiwan_buckets,
+            buckets_fn=taiwan_dbz_buckets,
         )
 
         self.val_metrics = create_metrics(self.T_out, "val")
@@ -129,7 +137,7 @@ class RainPro8Module(L.LightningModule):
             need_forecast=True,
             need_target=True,
             need_loss=True,
-            need_probs=False,
+            need_probs=True,
         )
         eval_outputs = self.forward(batch, eval_request)
         assert isinstance(eval_outputs, EvalOutputs)
@@ -158,7 +166,19 @@ def create_metrics(num_lead_times: int, stage: str) -> MetricCollection:
     metric_dict = {
         "csi": CriticalSuccessIndex(
             num_lead_times=num_lead_times,
-            thresholds=CSI_THRESHOLDS_MMH,
-        )
+            thresholds=CSI_THRESHOLDS_DBZ,
+        ),
+        "contingency": ContingencyMetrics(
+            num_lead_times=num_lead_times,
+            thresholds=CSI_THRESHOLDS_DBZ,
+        ),
+        "fss": FractionsSkillScore(
+            num_lead_times=num_lead_times,
+            thresholds=CSI_THRESHOLDS_DBZ,
+        ),
+        "crps": CRPS(num_lead_times=num_lead_times),
+        "brier": BrierScore(num_lead_times=num_lead_times),
+        "reliability": ReliabilityAccumulator(num_lead_times=num_lead_times),
+        "mae_mse": LeadTimeMAEMSE(num_lead_times=num_lead_times),
     }
     return MetricCollection(metric_dict, prefix=f"{stage}/")

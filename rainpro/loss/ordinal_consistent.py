@@ -31,17 +31,29 @@ def _sevir_buckets(normalize: bool = True):
     return buckets
 
 
-def taiwan_buckets(normalize: bool = False):
-    """Precipitation intensity classes (mm/h) used for RainPro-8, App. E of the paper.
+def taiwan_dbz_buckets(normalize: bool = False):
+    """Radar reflectivity classes (dBZ) used for RainPro-8-TW.
 
-    Unlike `_sevir_buckets` (raw 8-bit VIL codes), targets here are already in mm/h
-    (QPESUMS max dBZ converted via Marshall-Palmer, see `rainpro.data.marshall_palmer`),
-    so `normalize` is a no-op kept only for interface parity with `_sevir_buckets`.
+    The task is defined directly on QPESUMS max dBZ -- GT is raw dBZ, not a
+    Marshall-Palmer mm/h conversion (`rainpro.data.marshall_palmer` is kept
+    only for post-hoc relabeling/reporting, e.g.
+    `rainpro.metrics.probabilistic.CRPS`, not for the training/target path;
+    see `docs/rainpro_tw_implementation_notes.md`). Unlike `_sevir_buckets`
+    (raw 8-bit VIL codes), `normalize` is a no-op kept only for interface
+    parity with `_sevir_buckets`.
+
+    Boundaries are deliberately *not* an even split: 5 dB steps below 25 dBZ
+    (where most of Taiwan's rain/no-rain and light-rain distinction lives),
+    3 dB steps from 25-55 dBZ (dense enough to resolve convective structure
+    without approaching radar quantization noise), and a 60 dBZ ceiling
+    (Taiwan convection routinely reaches 55-60 dBZ; the mm/h-derived boundary
+    set this replaces topped out at ~45.4 dBZ, compressing all strong
+    convection into one bin).
     """
     del normalize
     thresholds = [
-        0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 3.0, 4.0, 5.0,
-        6.0, 7.0, 8.0, 9.0, 10.0, 15.0, 20.0, 25.0,
+        5.0, 10.0, 15.0, 20.0, 25.0, 28.0, 31.0, 34.0, 37.0, 40.0,
+        43.0, 46.0, 49.0, 52.0, 55.0, 60.0,
     ]
     buckets = []
     prev = 0.0
