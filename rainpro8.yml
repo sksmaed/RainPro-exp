@@ -4,14 +4,20 @@
 #
 # Usage:
 #   python main_rainpro8.py fit <run_name> --config rainpro8.yml \
-#       --data.data_root.qpesums <path> --data.data_root.sta_h8 <path>
+#       --data.data_root '{"qpesums": <path>, "sta_h8": <path>}'
 #
-# To include GFS, add `--data.include_gfs true --data.data_root.gfs <path>
-# --data.data_root.gfs_forecast <path>`. `data.gfs_variables` defaults to the
-# paper's 122-channel App. I selection (`GFS_ANALYSIS_VARIABLES` in
-# rainpro/data/rainpro8_sources.py); pass `--data.gfs_variables [...]` only to
-# override it, and `--data.variable_aliases {...}` if the real GFS zarr store
-# names fields differently than those canonical names.
+# NOTE: `data_root` is a plain `dict[str, str]`, not a nested config class, so
+# jsonargparse does *not* support per-key dotted overrides like
+# `--data.data_root.qpesums <path>` -- that silently resets the whole dict to
+# `None` instead of merging. Always pass the full dict as one JSON string.
+#
+# To include GFS, add `--data.include_gfs true --data.data_root
+# '{"qpesums": <path>, "sta_h8": <path>, "gfs": <path>, "gfs_forecast": <path>}'`.
+# `data.gfs_variables` defaults to the paper's 122-channel App. I selection
+# (`GFS_ANALYSIS_VARIABLES` in rainpro/data/rainpro8_sources.py); pass
+# `--data.gfs_variables [...]` only to override it, and
+# `--data.variable_aliases {...}` if the real GFS zarr store names fields
+# differently than those canonical names.
 #
 # For a radar-only ablation arm, add `--data.include_satellite false` (QPESUMS
 # stays; only STA_H8 drops out -- `data_root.sta_h8` becomes unused).
@@ -37,11 +43,14 @@ model:
 data:
   include_satellite: true # set false to drop STA_H8 for a radar-only (QPESUMS-only) ablation arm
   include_gfs: false # set true (+ data_root.gfs / gfs_forecast) to add GFS as a 16km-tier input
-  data_root:
-    qpesums: # path to QPESUMS zarr store (max dBZ)
-    sta_h8: # path to STA_H8 zarr store (9 IR bands)
-    # gfs: # path to GFS zarr store, only needed when include_gfs=true
-    # gfs_forecast: # path to GFS forecast zarr store, only needed when include_gfs=true
+  # jsonargparse deep-merges dict-typed params across config/CLI sources, so a
+  # placeholder key set to a blank (null) value here would survive a CLI
+  # override that only touches other keys, then fail `dict[str, str]`
+  # validation (null isn't str) -- see the NOTE above. Keep this empty and
+  # always pass the full set of keys you need via `--data.data_root '{...}'`:
+  # qpesums (QPESUMS zarr, max dBZ), sta_h8 (STA_H8 zarr, 9 IR bands; only
+  # when include_satellite=true), gfs / gfs_forecast (only when include_gfs=true).
+  data_root: {}
   start_date: 2023-12-01
   end_date: 2024-11-30
   cycle_train_days: 12

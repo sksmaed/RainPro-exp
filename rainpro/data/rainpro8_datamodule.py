@@ -18,8 +18,8 @@ from rainpro.data.rainpro8_sources import GFS_ANALYSIS_VARIABLES, SourceSpec, bu
 
 
 def cycle_split(
-    start: datetime.datetime,
-    end: datetime.datetime,
+    start: datetime.datetime | str,
+    end: datetime.datetime | str,
     train_days: int,
     val_days: int,
     test_days: int,
@@ -65,8 +65,13 @@ class RainPro8DataModule(LightningDataModule):
     def __init__(
         self,
         data_root: dict[str, str],
-        start_date: datetime.datetime,
-        end_date: datetime.datetime,
+        # `str` (e.g. "2021-06-01"), not `datetime.datetime`: jsonargparse has no
+        # built-in CLI/YAML parsing for bare `datetime.datetime`-typed params (it
+        # falls through to its Path/class-path fallbacks and errors on any plain
+        # date string, from --config *or* CLI overrides alike). `cycle_split`
+        # converts via `pd.Timestamp`, which accepts ISO date strings directly.
+        start_date: str,
+        end_date: str,
         include_satellite: bool = True,
         include_gfs: bool = False,
         cycle_train_days: int = 12,
