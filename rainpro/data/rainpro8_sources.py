@@ -162,10 +162,15 @@ def build_taiwan_sources(
     (or `()`) to override -- `gfs_variables`/`gfs_forecast_variables` stay
     configurable so the exact channel count can be tuned without code changes.
 
-    `satellite_8km` samples every 10 min (7 steps) rather than the paper's
-    15 min/5-step EUMETSAT cadence: STA_H8 is a native 10-minute product,
-    unlike EUMETSAT's ~1h-delayed feed that motivated the paper's coarser,
-    -60min-starting window (Sec. A.2).
+    `satellite_8km` samples hourly (2 steps: -120, -60 min), not the 10-minute
+    cadence originally assumed here (nor the paper's 15 min/5-step EUMETSAT
+    cadence): scripts/inspect_sta_h8_times.py against the real
+    `/work/kilin1203/datasets/STA_H8` archive found a modal cadence of 1h
+    (~98% of intervals), i.e. this staging copy is hourly, not the 10-minute
+    native product STA_H8 otherwise is -- see `TIME_TOLERANCE["satellite_8km"]`
+    in `rainpro8_dataset.py`, widened to match (same as `gfs_forecast_16km`,
+    which is also hourly). If a finer-grained STA_H8 source is later wired in,
+    revert this to the 10-minute window.
     """
     sources: dict[str, SourceSpec] = {
         "target_2km": SourceSpec(
@@ -203,7 +208,7 @@ def build_taiwan_sources(
             tier="8km",
             resolution_km=8,
             size_km=1536,
-            offsets_min=tuple(range(-120, -50, 10)),  # -120..-60 min @ 10 min, 7 steps
+            offsets_min=(-120, -60),  # -120, -60 min @ hourly, 2 steps (see docstring)
             variables=tuple(STA_H8_BANDS),
         )
 

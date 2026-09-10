@@ -8,12 +8,14 @@ from __future__ import annotations
 import datetime
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 from lightning.pytorch import LightningDataModule
 from torch.utils.data import DataLoader
 
-from rainpro.data.rainpro8_dataset import RainPro8Dataset
+from rainpro.data import sta_h8_raw
+from rainpro.data.rainpro8_dataset import TIME_TOLERANCE, RainPro8Dataset
 from rainpro.data.rainpro8_sources import GFS_ANALYSIS_VARIABLES, SourceSpec, build_taiwan_sources
 
 
@@ -142,6 +144,33 @@ class RainPro8DataModule(LightningDataModule):
             available = set(pd.DatetimeIndex(ds["time"].values))
         for split in self.split_times:
             self.split_times[split] = [t for t in self.split_times[split] if t in available]
+
+        # STA_H8's real archive has large fully-missing stretches (e.g. ~2
+        # months at the start of 2021, see scripts/inspect_sta_h8_times.py) on
+        # top of its per-timestamp availability -- unlike the per-pixel
+        # radar-coverage case above, this isn't a "some fraction missing"
+        # situation but whole init_times where *every* `satellite_8km` offset
+        # would silently come back as `fill_value` (see `RainPro8Dataset.
+        # _read_frame`'s `except KeyError` branch). Drop those init_times
+        # instead of training on satellite input that's entirely padding.
+        # STA_H8 is read straight from raw .btp files (rainpro.data.sta_h8_raw),
+        # not a zarr store -- `sta_h8_path` is the raw directory root. This
+        # walks it directly rather than going through `RainPro8Dataset._get_store`
+        # (which would additionally build the full lazy dask Dataset; we only
+        # need the time index here).
+        sta_h8_path = self.data_root.get("sta_h8")
+        if self.include_satellite and sta_h8_path is not None:
+            _, sat_times = sta_h8_raw.scan_files(sta_h8_path)
+            sat_index = pd.DatetimeIndex(sat_times).sort_values()
+            offsets = self.sources["satellite_8km"].offsets_min
+            tolerance = pd.Timedelta(TIME_TOLERANCE["satellite_8km"])
+            for split in self.split_times:
+                times = pd.DatetimeIndex(self.split_times[split])
+                covered = np.ones(len(times), dtype=bool)
+                for offset in offsets:
+                    query = times + pd.Timedelta(minutes=offset)
+                    covered &= sat_index.get_indexer(query, method="nearest", tolerance=tolerance) != -1
+                self.split_times[split] = list(times[covered])
 
     def _dataloader(self, split: Literal["train", "val", "test"]) -> DataLoader:
         dataset = RainPro8Dataset(

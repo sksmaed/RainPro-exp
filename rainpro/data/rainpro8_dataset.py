@@ -25,6 +25,7 @@ import torch
 import xarray as xr
 from torch.utils.data import Dataset
 
+from rainpro.data import sta_h8_raw
 from rainpro.data.normalize import DEFAULT_NORM_BOUNDS, minmax_normalize
 from rainpro.data.regrid import NearestNeighborRegridder, target_grid
 from rainpro.data.rainpro8_sources import SourceSpec
@@ -43,7 +44,12 @@ TIME_TOLERANCE = {
     "target_2km": "5min",
     "radar_4km": "5min",
     "radar_8km": "5min",
-    "satellite_8km": "5min",
+    # STA_H8's real archive is hourly, not the originally-assumed 10-minute
+    # cadence (see `build_taiwan_sources`'s `satellite_8km` docstring note) --
+    # widened to match `gfs_forecast_16km` below, the other hourly source, so a
+    # query offset that doesn't land exactly on the hour still snaps to the
+    # nearest real timestamp instead of always missing by design.
+    "satellite_8km": "31min",
     "gfs_16km": "3h",
     "gfs_forecast_16km": "31min",
 }
@@ -117,7 +123,16 @@ class RainPro8Dataset(Dataset):
                     f"data_root is missing a zarr path for '{store_key}'; "
                     f"got keys {list(self.data_root)}"
                 )
-            self._datasets[store_key] = xr.open_zarr(path, consolidated=True)
+            if store_key == "sta_h8":
+                # Never converted to zarr (read-only source dir, no local quota
+                # for a converted copy) -- read raw .btp files directly instead,
+                # via a lazy dask-backed xr.Dataset with the same `.sel(...)`
+                # surface a real zarr store would have. `path` here is the raw
+                # STA_H8 directory root, not a zarr path.
+                latlon_path = self.data_root.get("sta_h8_latlon", sta_h8_raw.DEFAULT_LATLON_PATH)
+                self._datasets[store_key] = sta_h8_raw.open_sta_h8_raw(path, latlon_path)
+            else:
+                self._datasets[store_key] = xr.open_zarr(path, consolidated=True)
         return self._datasets[store_key]
 
     def _get_regridder(self, store_key: str) -> NearestNeighborRegridder:

@@ -51,10 +51,17 @@ data:
   # qpesums (QPESUMS zarr, max dBZ), sta_h8 (STA_H8 zarr, 9 IR bands; only
   # when include_satellite=true), gfs / gfs_forecast (only when include_gfs=true).
   data_root: {}
-  start_date: 2023-12-01
-  end_date: 2024-11-30
-  cycle_train_days: 12
-  cycle_val_days: 2
+  # Full 2021 (QPESUMS covers it; STA_H8's real archive only spans late-Feb
+  # through late-Dec 2021 -- `RainPro8DataModule.setup()` drops any init_time
+  # without satellite coverage from every split when include_satellite=true,
+  # so the missing Jan/Feb stretch and other gaps are excluded automatically
+  # rather than training on all-fill_value satellite input).
+  start_date: 2021-01-01
+  end_date: 2022-01-01
+  # 17:1:2 day cycle == 85/5/10 train/val/test, repeated through the year so
+  # no single split is skewed toward one season (paper Sec. A.3 rationale).
+  cycle_train_days: 17
+  cycle_val_days: 1
   cycle_test_days: 2
   cycle_blackout_hours: 12
   center_lat: 23.7
