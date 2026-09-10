@@ -231,6 +231,7 @@ class RainPro8Dataset(Dataset):
         for var in spec.variables:
             raw_name = self.variable_aliases.get(var, var)
             data = np.asarray(frame_ds[raw_name].values, dtype=np.float32)
+            data = _mask_missing(data, spec.missing_values)
             regridded = regridder(data, dst_lat, dst_lon, fill_value=np.nan)
             if normalize:
                 regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
@@ -240,6 +241,7 @@ class RainPro8Dataset(Dataset):
             raw_name = self.variable_aliases.get(var, var)
             data = np.asarray(frame_ds[raw_name].values, dtype=np.float32)  # (level, y, x)
             data = data[list(spec.levels)]
+            data = _mask_missing(data, spec.missing_values)
             regridded = regridder(data, dst_lat, dst_lon, fill_value=np.nan)
             if normalize:
                 regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
@@ -249,6 +251,18 @@ class RainPro8Dataset(Dataset):
         if not keep_nan:
             out = np.where(np.isnan(out), self.fill_value, out)
         return out
+
+
+def _mask_missing(data: np.ndarray, missing_values: Sequence[float]) -> np.ndarray:
+    """Replace a source's raw missing-value sentinels (e.g. QPESUMS' -999/-99,
+    see `rainpro8_sources.QPESUMS_MISSING_VALUES`) with NaN, in place of the
+    literal flag value, before any clipping/normalization happens."""
+    if not missing_values:
+        return data
+    mask = np.zeros(data.shape, dtype=bool)
+    for value in missing_values:
+        mask |= np.isclose(data, value)
+    return np.where(mask, np.nan, data)
 
 
 def _tolerance(spec: SourceSpec) -> pd.Timedelta:

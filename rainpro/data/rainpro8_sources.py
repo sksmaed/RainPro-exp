@@ -45,6 +45,10 @@ Tier = str  # "target_2km" | "4km" | "8km" | "16km"
 
 STA_H8_BANDS = [f"B{i:02d}" for i in range(8, 17)]  # B08..B16, 9 IR bands
 
+# QPESUMS' documented missing-value sentinels (docs/rainpro_dataset.md); confirmed
+# present in the real store (e.g. -99.0 around Taiwan's coastline/coverage edge).
+QPESUMS_MISSING_VALUES: tuple[float, ...] = (-999.0, -99.0)
+
 # Paper App. I (Table 11): the 122 `gfs_16km` channels kept from the full GFS
 # field set, flattened to one canonical name per (variable, level) pair --
 # e.g. "TMP_850mb", "TMP_surface" -- with bare GRIB2 codes (e.g. "PRATE") for
@@ -113,6 +117,12 @@ class SourceSpec:
     variables_3d: Sequence[str] = ()  # level-resolved variables, see `levels`
     levels: Sequence[int] = ()  # pressure levels shared by all `variables_3d`
     fill_value: float = 0.0
+    # Raw sentinel values (e.g. QPESUMS' -999/-99, see docs/rainpro_dataset.md)
+    # that mark missing data in the *source* store and must be masked to NaN
+    # before clipping/normalizing -- otherwise they're indistinguishable from
+    # real physical values (e.g. -999 dBZ clipped into DBZ_RANGE) and, for
+    # `target_2km` specifically, flow straight into the loss/metrics unmasked.
+    missing_values: Sequence[float] = ()
 
     @property
     def size_px(self) -> int:
@@ -165,6 +175,7 @@ def build_taiwan_sources(
             size_km=512,
             offsets_min=tuple(range(10, 370, 10)),  # 0-6h @ 10 min, 36 steps
             variables=("max_dbz",),
+            missing_values=QPESUMS_MISSING_VALUES,
         ),
         "radar_4km": SourceSpec(
             name="radar_4km",
@@ -173,6 +184,7 @@ def build_taiwan_sources(
             size_km=1024,
             offsets_min=tuple(range(-60, 10, 10)),  # -60..0 min, 7 steps
             variables=("max_dbz",),
+            missing_values=QPESUMS_MISSING_VALUES,
         ),
         "radar_8km": SourceSpec(
             name="radar_8km",
@@ -181,6 +193,7 @@ def build_taiwan_sources(
             size_km=1536,
             offsets_min=(0,),
             variables=("max_dbz",),
+            missing_values=QPESUMS_MISSING_VALUES,
         ),
     }
 
