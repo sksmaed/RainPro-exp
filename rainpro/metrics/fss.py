@@ -1,7 +1,6 @@
 """Fractions Skill Score (FSS), pooled per (threshold, window, lead_time).
 
-Neighborhood window is a square side length in {1, 2, 4, 8} grid cells
-(window=1 has no pooling and should numerically match
+Neighborhood window is a square side length in {1, 2, 4, 8} grid cells, and
 `rainpro.metrics.csi.CriticalSuccessIndex` restricted to the same threshold
 -- a useful correctness check, see `tests/test_metrics.py`).
 
