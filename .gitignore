@@ -3,7 +3,7 @@ runs/
 wandb/
 .venv/
 __pycache__/
-data/
+/data/
 checkpoints/
 uv.lock
 .DS_Store

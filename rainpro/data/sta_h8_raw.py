@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -107,7 +108,11 @@ def scan_files(root: str) -> tuple[dict[tuple[pd.Timestamp, str], str], list[pd.
 def _load_or_nan(path: str | None) -> np.ndarray:
     if path is None:
         return np.full((IY, IX), np.nan, dtype=np.float32)
-    return load_band_frame(path)
+    try:
+        return load_band_frame(path)
+    except (ValueError, OSError) as e:
+        warnings.warn(f"STA_H8: unreadable file {path!r} ({e}); treating as missing", stacklevel=2)
+        return np.full((IY, IX), np.nan, dtype=np.float32)
 
 
 _delayed_load = dask.delayed(_load_or_nan)
