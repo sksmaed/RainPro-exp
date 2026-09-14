@@ -17,6 +17,8 @@ the source-spec's canonical variable names without touching
 from __future__ import annotations
 
 import datetime
+import os
+from collections import OrderedDict
 from typing import Sequence
 
 import numpy as np
@@ -61,6 +63,12 @@ TIME_TOLERANCE = {
 DEFAULT_LATLON_CANDIDATES = [("lat", "lon"), ("XLAT", "XLONG"), ("latitude", "longitude")]
 
 
+def _is_zarr_store(path: str) -> bool:
+    """A zarr v3 group root has a `zarr.json` directly under it; a raw STA_H8
+    directory tree (nested `YYYY/MM/DD/.../*.btp`) never does."""
+    return os.path.isfile(os.path.join(path, "zarr.json"))
+
+
 class RainPro8Dataset(Dataset):
     def __init__(
         self,
@@ -75,6 +83,7 @@ class RainPro8Dataset(Dataset):
         latlon_names: dict[str, tuple[str, str]] | None = None,
         fill_value: float = 0.0,
         rng_seed: int = 0,
+        frame_cache_size: int = 64,
     ):
         self.data_root = data_root
         self.sources = sources
@@ -92,6 +101,23 @@ class RainPro8Dataset(Dataset):
 
         self._datasets: dict[str, xr.Dataset] = {}
         self._regridders: dict[str, NearestNeighborRegridder] = {}
+        # Per-worker LRU cache of *pre-regrid* (store_key, raw_name, resolved
+        # timestamp) -> raw (masked) ndarray, keyed on the timestamp actually
+        # resolved by `.sel(..., method="nearest")` rather than the query time,
+        # so two samples whose offsets snap to the same underlying frame share
+        # one disk read. Deliberately caches before regridding (not after):
+        # `jitter_km` randomizes `dst_lat`/`dst_lon` per sample, so the
+        # regridded result differs per sample even when the source frame is
+        # identical -- only the load+missing-mask step is safe to reuse. Most
+        # valuable for sources whose offsets overlap heavily between adjacent
+        # samples (radar_4km's 7 offsets @ 10 min, satellite_8km's hourly
+        # frames reused by every 10-min target sample within that hour) and,
+        # even for a single sample, whenever `variables`/`variables_3d` shares
+        # a raw store access across bands/levels that live in one file (e.g.
+        # `sta_h8_raw`'s raw `.btp` reader) -- see `rainpro/data/sta_h8_raw.py`
+        # and `scripts/compress_sta_h8_taiwan.py` for the I/O cost this avoids.
+        self._frame_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self._frame_cache_size = frame_cache_size
 
     def __len__(self) -> int:
         return len(self.init_times)
@@ -123,14 +149,23 @@ class RainPro8Dataset(Dataset):
                     f"data_root is missing a zarr path for '{store_key}'; "
                     f"got keys {list(self.data_root)}"
                 )
-            if store_key == "sta_h8":
-                # Never converted to zarr (read-only source dir, no local quota
-                # for a converted copy) -- read raw .btp files directly instead,
+            if store_key == "sta_h8" and not _is_zarr_store(path):
+                # Not (yet) converted by scripts/compress_sta_h8_taiwan.py --
+                # `path` is the raw STA_H8 directory root, not a zarr path.
+                # Fall back to reading raw .btp files directly and on demand,
                 # via a lazy dask-backed xr.Dataset with the same `.sel(...)`
-                # surface a real zarr store would have. `path` here is the raw
-                # STA_H8 directory root, not a zarr path.
+                # surface a real zarr store would have. This is a lot slower
+                # (full uncropped, uncached per-file reads off a shared
+                # filesystem) -- see that script's docstring and
+                # `rainpro/data/sta_h8_raw.py`'s.
                 latlon_path = self.data_root.get("sta_h8_latlon", sta_h8_raw.DEFAULT_LATLON_PATH)
                 self._datasets[store_key] = sta_h8_raw.open_sta_h8_raw(path, latlon_path)
+            elif store_key == "sta_h8":
+                # scripts/compress_sta_h8_taiwan.py's stores attempt consolidation
+                # but don't guarantee it (best-effort) -- consolidated=False always
+                # works, and unconsolidated open is only marginally slower for the
+                # handful of arrays (9 bands + time/lat/lon) this store has.
+                self._datasets[store_key] = xr.open_zarr(path, consolidated=False)
             else:
                 self._datasets[store_key] = xr.open_zarr(path, consolidated=True)
         return self._datasets[store_key]
@@ -177,6 +212,7 @@ class RainPro8Dataset(Dataset):
             frames = [
                 self._read_frame(
                     ds,
+                    store_key,
                     regridder,
                     spec,
                     init_time,
@@ -198,9 +234,39 @@ class RainPro8Dataset(Dataset):
 
         return sample
 
+    def _load_var(
+        self, store_key: str, frame_ds: xr.Dataset, raw_name: str, is_static: bool
+    ) -> np.ndarray:
+        """Raw (unmasked) ndarray for one variable of one resolved frame, via
+        `self._frame_cache` (see its docstring in `__init__`). Missing-value
+        masking is deliberately NOT done here -- it stays in the caller, applied
+        fresh on every call, since it's cheap (pure in-memory numpy) and, unlike
+        the raw load, isn't safe to treat as invariant across callers in general.
+        """
+        if is_static:
+            cache_key = (store_key, raw_name, None)
+        else:
+            # Keyed by the timestamp `.sel(..., method="nearest")` actually
+            # resolved to, not the query time -- two different query offsets
+            # that snap to the same underlying frame must hit the same cache
+            # entry. `.item()` on a 0-d datetime64 array gives a hashable int.
+            cache_key = (store_key, raw_name, frame_ds["time"].values.item())
+
+        cached = self._frame_cache.get(cache_key)
+        if cached is not None:
+            self._frame_cache.move_to_end(cache_key)
+            return cached
+
+        data = np.asarray(frame_ds[raw_name].values, dtype=np.float32)
+        self._frame_cache[cache_key] = data
+        if len(self._frame_cache) > self._frame_cache_size:
+            self._frame_cache.popitem(last=False)
+        return data
+
     def _read_frame(
         self,
         ds: xr.Dataset,
+        store_key: str,
         regridder: NearestNeighborRegridder,
         spec: SourceSpec,
         init_time: np.datetime64,
@@ -245,7 +311,7 @@ class RainPro8Dataset(Dataset):
         channels = []
         for var in spec.variables:
             raw_name = self.variable_aliases.get(var, var)
-            data = np.asarray(frame_ds[raw_name].values, dtype=np.float32)
+            data = self._load_var(store_key, frame_ds, raw_name, is_static)
             data = _mask_missing(data, spec.missing_values)
             regridded = regridder(data, dst_lat, dst_lon, fill_value=np.nan)
             if normalize:
@@ -254,7 +320,7 @@ class RainPro8Dataset(Dataset):
 
         for var in spec.variables_3d:
             raw_name = self.variable_aliases.get(var, var)
-            data = np.asarray(frame_ds[raw_name].values, dtype=np.float32)  # (level, y, x)
+            data = self._load_var(store_key, frame_ds, raw_name, is_static)  # (level, y, x)
             data = data[list(spec.levels)]
             data = _mask_missing(data, spec.missing_values)
             regridded = regridder(data, dst_lat, dst_lon, fill_value=np.nan)

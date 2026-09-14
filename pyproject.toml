@@ -18,7 +18,12 @@ dependencies = [
     "torchvision>=0.24.1",
     "wandb[media]>=0.25.1",
     "xarray>=2024.1.0",
-    "zarr>=2.17",
+    "zarr>=3.0", # zarr v3 python API (zarr.storage.LocalStore, zarr.codecs.*,
+    # zarr_format=3) is required by scripts/compress_sta_h8_taiwan.py, and
+    # already implicitly relied on to read the existing QPESUMS zarr v2 store
+    # read-only (zarr-python 3.x supports both v2 and v3 stores; 2.x does not
+    # support v3 at all) -- was ">=2.17" before, which permitted this anyway
+    # but didn't say so explicitly.
 ]
 
 [tool.uv.sources]

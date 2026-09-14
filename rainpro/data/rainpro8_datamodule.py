@@ -15,7 +15,7 @@ from lightning.pytorch import LightningDataModule
 from torch.utils.data import DataLoader
 
 from rainpro.data import sta_h8_raw
-from rainpro.data.rainpro8_dataset import TIME_TOLERANCE, RainPro8Dataset
+from rainpro.data.rainpro8_dataset import TIME_TOLERANCE, RainPro8Dataset, _is_zarr_store
 from rainpro.data.rainpro8_sources import GFS_ANALYSIS_VARIABLES, SourceSpec, build_taiwan_sources
 
 
@@ -86,6 +86,9 @@ class RainPro8DataModule(LightningDataModule):
         batch_size: int = 16,
         eval_batch_size: int | None = None,
         num_workers: int = 8,
+        persistent_workers: bool = True,
+        prefetch_factor: int | None = 4,
+        frame_cache_size: int = 64,
         norm_bounds: dict[str, tuple[float, float]] | None = None,
         variable_aliases: dict[str, str] | None = None,
         latlon_names: dict[str, tuple[str, str]] | None = None,
@@ -104,6 +107,18 @@ class RainPro8DataModule(LightningDataModule):
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size or batch_size
         self.num_workers = num_workers
+        # persistent_workers=True keeps worker processes (and everything they've
+        # lazily built: open zarr/dask handles, KDTree regridders, and each
+        # worker's RainPro8Dataset._frame_cache) alive across epochs instead of
+        # tearing them down and re-forking from scratch every epoch -- with the
+        # raw (non-zarr) STA_H8 fallback path in particular, a fresh worker
+        # re-does a full os.walk of the source tree via sta_h8_raw.scan_files()
+        # on first access, so without this that scan (and every store's lazy-open
+        # cost) repeats every single epoch. Only meaningful when num_workers > 0
+        # (torch.utils.data.DataLoader rejects it otherwise).
+        self.persistent_workers = persistent_workers and num_workers > 0
+        self.prefetch_factor = prefetch_factor if num_workers > 0 else None
+        self.frame_cache_size = frame_cache_size
         self.norm_bounds = norm_bounds
         self.variable_aliases = variable_aliases
         self.latlon_names = latlon_names
@@ -153,14 +168,19 @@ class RainPro8DataModule(LightningDataModule):
         # would silently come back as `fill_value` (see `RainPro8Dataset.
         # _read_frame`'s `except KeyError` branch). Drop those init_times
         # instead of training on satellite input that's entirely padding.
-        # STA_H8 is read straight from raw .btp files (rainpro.data.sta_h8_raw),
-        # not a zarr store -- `sta_h8_path` is the raw directory root. This
-        # walks it directly rather than going through `RainPro8Dataset._get_store`
-        # (which would additionally build the full lazy dask Dataset; we only
-        # need the time index here).
+        # `sta_h8_path` is either a raw STA_H8 directory root (read straight
+        # from `.btp` files, rainpro.data.sta_h8_raw) or a zarr v3 store from
+        # scripts/compress_sta_h8_taiwan.py -- same detection
+        # `RainPro8Dataset._get_store` uses. Either way this only needs the
+        # time index, not the full lazy Dataset (`RainPro8Dataset._get_store`
+        # would additionally build regridders etc.), so it's read directly here.
         sta_h8_path = self.data_root.get("sta_h8")
         if self.include_satellite and sta_h8_path is not None:
-            _, sat_times = sta_h8_raw.scan_files(sta_h8_path)
+            if _is_zarr_store(sta_h8_path):
+                with xr.open_zarr(sta_h8_path, consolidated=False) as sat_ds:
+                    sat_times = pd.DatetimeIndex(sat_ds["time"].values)
+            else:
+                _, sat_times = sta_h8_raw.scan_files(sta_h8_path)
             sat_index = pd.DatetimeIndex(sat_times).sort_values()
             offsets = self.sources["satellite_8km"].offsets_min
             tolerance = pd.Timedelta(TIME_TOLERANCE["satellite_8km"])
@@ -183,6 +203,7 @@ class RainPro8DataModule(LightningDataModule):
             norm_bounds=self.norm_bounds,
             variable_aliases=self.variable_aliases,
             latlon_names=self.latlon_names,
+            frame_cache_size=self.frame_cache_size,
         )
         return DataLoader(
             dataset,
@@ -191,6 +212,8 @@ class RainPro8DataModule(LightningDataModule):
             pin_memory=True,
             shuffle=split == "train",
             drop_last=split == "train",
+            persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
         )
 
     def train_dataloader(self) -> DataLoader:

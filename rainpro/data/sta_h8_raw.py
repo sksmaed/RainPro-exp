@@ -2,17 +2,27 @@
 
 STA_H8 (Himawari-8/9 IR brightness temperature, 2750x2750 LCC, 9 bands
 B08-B16, hourly -- see docs/rainpro_dataset.md and the real-archive findings
-in scripts/inspect_sta_h8_times.py) has never been converted to zarr: the
-source directory is read-only here, and even a compressed year would be
-several hundred GB to a few TB (per the reference conversion project below),
-far past a typical local/home quota. Rather than writing a converted copy
-anywhere, this reads `.btp` files directly and on demand, wrapped in a lazy
-dask-backed `xr.Dataset` so `RainPro8Dataset._read_frame`'s existing
+in scripts/inspect_sta_h8_times.py) was originally never converted to zarr:
+the source directory is read-only, and even a compressed *full-frame* year
+would be several hundred GB to a few TB (per the reference conversion
+project below), far past a typical local/home quota. This module's
+`open_sta_h8_raw()` reads `.btp` files directly and on demand instead,
+wrapped in a lazy dask-backed `xr.Dataset` so `RainPro8Dataset._read_frame`'s
 `ds.sel(time=..., method="nearest", tolerance=...)` / `frame_ds[var].values`
-code path works completely unmodified -- only `RainPro8Dataset._get_store`
-needs to call `open_sta_h8_raw()` instead of `xr.open_zarr()` for this one
-store. Each `.values` access triggers exactly one `.btp` file read (per
-band, per timestep actually requested), not an eager load of the archive.
+code path works unmodified against it. Each `.values` access triggers
+exactly one `.btp` file read (per band, per timestep actually requested),
+not an eager load of the archive -- this makes it usable with zero
+preprocessing, but at training time it means re-reading full 2750x2750
+(~30 MB) frames from a shared network filesystem, over and over (no
+caching), for every sample that needs them; see
+`scripts/compress_sta_h8_taiwan.py` for a one-time preprocessing step that
+fixes this by cropping to the region RainPro8 actually trains on and
+writing a real (small, compressed) zarr v3 store -- `RainPro8Dataset._get_store`
+now prefers that store when `data_root["sta_h8"]` points at one (detected via
+a `zarr.json` at that path), and only falls back to this raw, on-demand
+reader otherwise. `crop_bounds()` below is the shared helper both that
+script and any caller computing a matching crop use to pick the crop
+window.
 
 Raw format confirmed against real data by
 github.com/sksmaed/weather_data_compression's compress/sta_h8.py and
@@ -116,6 +126,31 @@ def _load_or_nan(path: str | None) -> np.ndarray:
 
 
 _delayed_load = dask.delayed(_load_or_nan)
+
+
+def crop_bounds(
+    lat: np.ndarray,
+    lon: np.ndarray,
+    lat_min: float,
+    lat_max: float,
+    lon_min: float,
+    lon_max: float,
+) -> tuple[slice, slice]:
+    """Row/col slices of the smallest axis-aligned bounding box covering every
+    pixel with `lat_min <= lat <= lat_max` and `lon_min <= lon <= lon_max`.
+
+    STA_H8's LCC projection means a lat/lon box isn't axis-aligned in (row,
+    col) space either, so the returned slice is the tightest rectangle
+    containing it (it will include some corner pixels outside the box).
+    """
+    within = (lat >= lat_min) & (lat <= lat_max) & (lon >= lon_min) & (lon <= lon_max)
+    if not within.any():
+        raise ValueError(
+            f"No STA_H8 pixels within lat[{lat_min},{lat_max}] lon[{lon_min},{lon_max}]"
+        )
+    rows = np.flatnonzero(within.any(axis=1))
+    cols = np.flatnonzero(within.any(axis=0))
+    return slice(int(rows.min()), int(rows.max()) + 1), slice(int(cols.min()), int(cols.max()) + 1)
 
 
 def open_sta_h8_raw(root: str, latlon_path: str = DEFAULT_LATLON_PATH) -> xr.Dataset:

@@ -21,6 +21,16 @@
 #
 # For a radar-only ablation arm, add `--data.include_satellite false` (QPESUMS
 # stays; only STA_H8 drops out -- `data_root.sta_h8` becomes unused).
+#
+# `data_root.sta_h8` accepts EITHER the raw STA_H8 directory (slow: full
+# 2750x2750 per-file reads off a shared filesystem, no caching -- see
+# rainpro/data/sta_h8_raw.py) OR the path to a zarr v3 store produced by
+# `scripts/compress_sta_h8_taiwan.py` (cropped to the region this config
+# actually trains on and compressed; auto-detected via a `zarr.json` at that
+# path by `RainPro8Dataset._get_store`) -- point it at the converted store
+# once you've run that script. See job-375131.{out,err} / that script's
+# docstring for why the raw path was the actual training-speed bottleneck,
+# not multi-GPU utilization.
 
 trainer:
   precision: '32'
@@ -69,4 +79,24 @@ data:
   train_jitter_km: 256
   batch_size: 16
   eval_batch_size: 16
-  num_workers: 16
+  # job-375131 ran this at num_workers=16 with `trainer.devices` overridden to
+  # 8 GPUs on the CLI -- that's 16*8=128 DataLoader worker *processes* on one
+  # node, which on most HPC nodes oversubscribes the CPU (check `nproc`) and,
+  # combined with every worker hitting the same shared STA_H8 filesystem, was
+  # the actual cause of the periodic ~80s-per-4-steps stalls in that run, not
+  # GPU compute. Lowered to 8 (8 GPUs * 8 = 64 total) as a safer default --
+  # tune to roughly (node CPU cores) / (GPUs per node), and lower further if
+  # you still see stalls after converting STA_H8 via
+  # scripts/compress_sta_h8_taiwan.py.
+  num_workers: 8
+  persistent_workers: true # keep worker processes (+ their open store handles /
+  # regridder KDTrees / RainPro8Dataset._frame_cache) alive across epochs
+  # instead of re-forking (and, on the raw STA_H8 fallback path, re-walking
+  # the whole source tree) every single epoch.
+  prefetch_factor: 4
+  frame_cache_size: 64 # per-worker LRU cache of raw (pre-regrid) source frames,
+  # keyed by (store, variable, resolved timestamp) -- dedupes repeat reads of
+  # the same underlying frame across samples whose offset windows overlap
+  # (e.g. satellite_8km's hourly frames, shared by every 10-min target sample
+  # within that hour). Raise if you have RAM to spare and see cache misses
+  # dominating; each entry is one (H, W) float32 source-resolution frame.
