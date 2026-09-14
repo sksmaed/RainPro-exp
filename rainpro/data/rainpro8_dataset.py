@@ -69,6 +69,18 @@ def _is_zarr_store(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "zarr.json"))
 
 
+def split_sta_h8_paths(data_root_value: str) -> list[str]:
+    """`data_root["sta_h8"]` may be a single path or a comma-separated list of
+    them -- the latter for when `scripts/compress_sta_h8_taiwan.py --freq
+    quarter` (or month/day) split one year across several stores (e.g. to fit
+    each under a different filesystem's quota, see that script's docstring).
+    `dict[str, str]` stays the type (no `list[str]` value) so this doesn't
+    collide with the `data_root` dict-merging footgun already documented in
+    rainpro8.yml (jsonargparse deep-merges dict-typed CLI params; a
+    list-typed value would just make that worse, not better)."""
+    return [p.strip() for p in data_root_value.split(",") if p.strip()]
+
+
 class RainPro8Dataset(Dataset):
     def __init__(
         self,
@@ -149,23 +161,67 @@ class RainPro8Dataset(Dataset):
                     f"data_root is missing a zarr path for '{store_key}'; "
                     f"got keys {list(self.data_root)}"
                 )
-            if store_key == "sta_h8" and not _is_zarr_store(path):
-                # Not (yet) converted by scripts/compress_sta_h8_taiwan.py --
-                # `path` is the raw STA_H8 directory root, not a zarr path.
-                # Fall back to reading raw .btp files directly and on demand,
-                # via a lazy dask-backed xr.Dataset with the same `.sel(...)`
-                # surface a real zarr store would have. This is a lot slower
-                # (full uncropped, uncached per-file reads off a shared
-                # filesystem) -- see that script's docstring and
-                # `rainpro/data/sta_h8_raw.py`'s.
-                latlon_path = self.data_root.get("sta_h8_latlon", sta_h8_raw.DEFAULT_LATLON_PATH)
-                self._datasets[store_key] = sta_h8_raw.open_sta_h8_raw(path, latlon_path)
-            elif store_key == "sta_h8":
-                # scripts/compress_sta_h8_taiwan.py's stores attempt consolidation
-                # but don't guarantee it (best-effort) -- consolidated=False always
-                # works, and unconsolidated open is only marginally slower for the
-                # handful of arrays (9 bands + time/lat/lon) this store has.
-                self._datasets[store_key] = xr.open_zarr(path, consolidated=False)
+            if store_key == "sta_h8":
+                paths = split_sta_h8_paths(path)
+                zarr_paths = [p for p in paths if _is_zarr_store(p)]
+                raw_paths = [p for p in paths if not _is_zarr_store(p)]
+                if zarr_paths and raw_paths:
+                    raise ValueError(
+                        f"data_root['sta_h8'] mixes converted zarr store(s) {zarr_paths} with "
+                        f"raw directory path(s) {raw_paths} -- must be all one or the other"
+                    )
+                if raw_paths:
+                    # Not (yet) converted by scripts/compress_sta_h8_taiwan.py --
+                    # only a single raw directory root is supported (there's no
+                    # natural way to "concat" two overlapping raw directory
+                    # trees the way there is for disjoint-in-time zarr stores
+                    # below). Falls back to reading raw .btp files directly and
+                    # on demand, via a lazy dask-backed xr.Dataset with the same
+                    # `.sel(...)` surface a real zarr store would have -- a lot
+                    # slower (full uncropped, uncached per-file reads off a
+                    # shared filesystem) -- see that script's docstring and
+                    # `rainpro/data/sta_h8_raw.py`'s.
+                    if len(raw_paths) != 1:
+                        raise ValueError(
+                            f"data_root['sta_h8'] has {len(raw_paths)} raw (non-zarr) directory "
+                            f"paths {raw_paths}; only a single raw directory is supported -- "
+                            f"convert with scripts/compress_sta_h8_taiwan.py first if you need "
+                            f"to combine multiple sources"
+                        )
+                    latlon_path = self.data_root.get("sta_h8_latlon", sta_h8_raw.DEFAULT_LATLON_PATH)
+                    self._datasets[store_key] = sta_h8_raw.open_sta_h8_raw(raw_paths[0], latlon_path)
+                else:
+                    # scripts/compress_sta_h8_taiwan.py's stores attempt
+                    # consolidation but don't guarantee it (best-effort) --
+                    # consolidated=False always works, and unconsolidated open
+                    # is only marginally slower for the handful of arrays (9
+                    # bands + time/lat/lon) each of these stores has. Multiple
+                    # stores (e.g. one per quarter, possibly on different
+                    # filesystems -- see that script's `--freq quarter`) are
+                    # concatenated along time into one lazy Dataset; `sortby`
+                    # guarantees monotonic time regardless of the order the
+                    # paths were listed in, which `.sel(..., method="nearest")`
+                    # relies on.
+                    #
+                    # `data_vars="minimal"` is NOT optional here: "lat"/"lon"
+                    # are plain (y, x) data variables in this store (no "time"
+                    # dim, and nothing marks them as coords -- see
+                    # scripts/compress_sta_h8_taiwan.py's `create_array` calls),
+                    # so `xr.concat`'s default `data_vars="all"` broadcasts
+                    # them along the NEW "time" dim too, i.e. duplicates each
+                    # ~6 MB (y, x) array once per timestep (thousands of times)
+                    # instead of keeping the one (y, x) array every quarter
+                    # already shares (same crop box) -- verified this OOM-kills
+                    # a concat of just 2 small test stores. "minimal" only
+                    # concatenates variables that actually vary along "time"
+                    # (the 9 bands), taking lat/lon from the first dataset as-is.
+                    datasets = [xr.open_zarr(p, consolidated=False) for p in zarr_paths]
+                    ds = (
+                        xr.concat(datasets, dim="time", data_vars="minimal", coords="minimal")
+                        if len(datasets) > 1
+                        else datasets[0]
+                    )
+                    self._datasets[store_key] = ds.sortby("time") if len(datasets) > 1 else ds
             else:
                 self._datasets[store_key] = xr.open_zarr(path, consolidated=True)
         return self._datasets[store_key]

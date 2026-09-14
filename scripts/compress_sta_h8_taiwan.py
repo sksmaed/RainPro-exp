@@ -1,6 +1,10 @@
 """One-time preprocessing: crop STA_H8 raw `.btp` files to the Taiwan region
 RainPro8 actually trains on, and write the result as a compressed Zarr v3
-store (one store per `--freq` period, default a whole year).
+store (one store per `--freq` period, default a whole year; `--freq quarter`
+splits a year into 4 stores -- run this 4x with different --start/--end/--out
+to spread output across filesystems/quotas, e.g. some quarters on /work and
+some on /home; RainPro8Dataset._get_store accepts a comma-separated list of
+store paths for data_root["sta_h8"] to read them back as one time series).
 
 Why this exists
 ----------------
@@ -117,8 +121,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rainpro.data import sta_h8_raw
 from rainpro.data.rainpro8_sources import build_taiwan_sources
 
-FREQ_CHOICES = ("day", "month", "year")
-_PERIOD_FMT = {"day": "%Y%m%d", "month": "%Y%m", "year": "%Y"}
+FREQ_CHOICES = ("day", "month", "quarter", "year")
+_PERIOD_FMT = {"day": "%Y%m%d", "month": "%Y%m", "year": "%Y"}  # "quarter" is special-cased below (no strftime code for it)
 
 # Stored as int64 minutes-since-epoch + a `units` attr (CF convention, which
 # xarray decodes back to datetime64 automatically on `xr.open_zarr`), not a
@@ -186,6 +190,8 @@ def warn_if_crop_too_tight(
 
 
 def period_key(d: dt.datetime, freq: str) -> str:
+    if freq == "quarter":
+        return f"{d.year}Q{(d.month - 1) // 3 + 1}"
     return d.strftime(_PERIOD_FMT[freq])
 
 
@@ -199,13 +205,19 @@ def period_bounds(key: str, freq: str) -> tuple[dt.datetime, dt.datetime]:
         start = dt.datetime(year, mon, 1)
         end = dt.datetime(year + (mon == 12), (mon % 12) + 1, 1)
         return start, end
+    if freq == "quarter":
+        year, q = int(key[:4]), int(key[5])  # "2021Q1" -> year=2021, q=1 (key[4] is literal "Q")
+        start_month = (q - 1) * 3 + 1
+        start = dt.datetime(year, start_month, 1)
+        end = dt.datetime(year + 1, 1, 1) if start_month == 10 else dt.datetime(year, start_month + 3, 1)
+        return start, end
     if freq == "year":
         year = int(key)
         return dt.datetime(year, 1, 1), dt.datetime(year + 1, 1, 1)
     raise ValueError(f"freq must be one of {FREQ_CHOICES}, got {freq!r}")
 
 
-_FREQ_PRECISION = {"year": 0, "month": 1, "day": 2}  # number of "-"-separated date parts kept
+_FREQ_PRECISION = {"year": 0, "month": 1, "quarter": 1, "day": 2}  # number of "-"-separated date parts kept
 
 
 def warn_if_start_end_finer_than_freq(start: str | None, end: str | None, freq: str) -> None:
@@ -467,8 +479,13 @@ def main() -> None:
                      help="output root; writes {out}/STA_H8/STA_H8_Taiwan_<period>.zarr "
                           "(default: /work/u3843478)")
     ap.add_argument("--freq", default="year", choices=FREQ_CHOICES,
-                     help="one zarr store per day/month/year (default: year, to match how "
-                          "QPESUMS is opened as a single store by RainPro8Dataset)")
+                     help="one zarr store per day/month/quarter/year (default: year, to match "
+                          "how QPESUMS is opened as a single store by RainPro8Dataset). "
+                          "'quarter' buckets by calendar quarter (Q1 Jan-Mar, ... Q4 Oct-Dec) "
+                          "-- e.g. run this 4x with --freq quarter and a different --start/--end/"
+                          "--out each time to split a year across filesystems/quotas; "
+                          "RainPro8Dataset._get_store supports data_root['sta_h8'] being a "
+                          "comma-separated list of such stores")
     ap.add_argument("--start", default=None, help="restrict to periods >= this date (YYYY[-MM[-DD]])")
     ap.add_argument("--end", default=None, help="restrict to periods <= this date (YYYY[-MM[-DD]]), inclusive")
     ap.add_argument("--lat-min", type=float, default=14.0)

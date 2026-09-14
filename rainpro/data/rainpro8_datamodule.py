@@ -15,7 +15,12 @@ from lightning.pytorch import LightningDataModule
 from torch.utils.data import DataLoader
 
 from rainpro.data import sta_h8_raw
-from rainpro.data.rainpro8_dataset import TIME_TOLERANCE, RainPro8Dataset, _is_zarr_store
+from rainpro.data.rainpro8_dataset import (
+    TIME_TOLERANCE,
+    RainPro8Dataset,
+    _is_zarr_store,
+    split_sta_h8_paths,
+)
 from rainpro.data.rainpro8_sources import GFS_ANALYSIS_VARIABLES, SourceSpec, build_taiwan_sources
 
 
@@ -168,20 +173,30 @@ class RainPro8DataModule(LightningDataModule):
         # would silently come back as `fill_value` (see `RainPro8Dataset.
         # _read_frame`'s `except KeyError` branch). Drop those init_times
         # instead of training on satellite input that's entirely padding.
-        # `sta_h8_path` is either a raw STA_H8 directory root (read straight
-        # from `.btp` files, rainpro.data.sta_h8_raw) or a zarr v3 store from
-        # scripts/compress_sta_h8_taiwan.py -- same detection
-        # `RainPro8Dataset._get_store` uses. Either way this only needs the
-        # time index, not the full lazy Dataset (`RainPro8Dataset._get_store`
-        # would additionally build regridders etc.), so it's read directly here.
+        # `sta_h8_path` is a comma-separated list (usually length 1) of either
+        # raw STA_H8 directory roots (read straight from `.btp` files,
+        # rainpro.data.sta_h8_raw) or zarr v3 stores from
+        # scripts/compress_sta_h8_taiwan.py -- same detection and same
+        # comma-separated-multi-store convention `RainPro8Dataset._get_store`
+        # uses (e.g. one store per quarter, possibly split across
+        # filesystems -- see that script's `--freq quarter`). Either way this
+        # only needs the time index, not the full lazy Dataset
+        # (`RainPro8Dataset._get_store` would additionally build regridders
+        # etc.), so it's read directly here.
         sta_h8_path = self.data_root.get("sta_h8")
         if self.include_satellite and sta_h8_path is not None:
-            if _is_zarr_store(sta_h8_path):
-                with xr.open_zarr(sta_h8_path, consolidated=False) as sat_ds:
-                    sat_times = pd.DatetimeIndex(sat_ds["time"].values)
-            else:
-                _, sat_times = sta_h8_raw.scan_files(sta_h8_path)
-            sat_index = pd.DatetimeIndex(sat_times).sort_values()
+            sat_times_parts: list[pd.DatetimeIndex] = []
+            for p in split_sta_h8_paths(sta_h8_path):
+                if _is_zarr_store(p):
+                    with xr.open_zarr(p, consolidated=False) as sat_ds:
+                        sat_times_parts.append(pd.DatetimeIndex(sat_ds["time"].values))
+                else:
+                    _, times = sta_h8_raw.scan_files(p)
+                    sat_times_parts.append(pd.DatetimeIndex(times))
+            sat_index = sat_times_parts[0]
+            for part in sat_times_parts[1:]:
+                sat_index = sat_index.union(part)
+            sat_index = sat_index.sort_values()
             offsets = self.sources["satellite_8km"].offsets_min
             tolerance = pd.Timedelta(TIME_TOLERANCE["satellite_8km"])
             for split in self.split_times:
