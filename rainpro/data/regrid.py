@@ -14,10 +14,30 @@ bilinear/conservative regridding (e.g. via `pyresample`) instead.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 from scipy.spatial import cKDTree
 
 KM_PER_DEG_LAT = 111.32
+
+
+@dataclass(frozen=True)
+class RegridMapping:
+    """Precomputed nearest-neighbor mapping from one regridder's source grid to
+    one destination grid -- everything `NearestNeighborRegridder.__call__` has
+    to do a `cKDTree.query()` for. Building it is the expensive part (one
+    query per destination pixel); applying it to a `src_data` array afterward
+    is just fancy indexing. Compute once via `NearestNeighborRegridder.
+    prepare()` and reuse via `.apply()` for every array that shares the same
+    (dst_lat, dst_lon) -- e.g. RainPro8Dataset regrids the same source onto
+    the same per-sample destination grid once per timestep offset (up to 36x
+    for target_2km) with `dst_lat`/`dst_lon` identical across every one of
+    those calls; querying the tree fresh each time was pure waste."""
+
+    idx: np.ndarray  # flat index into the source grid, one per dst pixel
+    invalid: np.ndarray  # dst_shape bool, True where no source pixel is within max_dist_km
+    dst_shape: tuple[int, ...]
 
 
 def target_grid(
@@ -62,6 +82,26 @@ class NearestNeighborRegridder:
         self.tree = cKDTree(points)
         self.max_dist_km = max_dist_km
 
+    def prepare(self, dst_lat: np.ndarray, dst_lon: np.ndarray) -> RegridMapping:
+        """The expensive half of regridding (one `cKDTree.query()` per
+        destination pixel) -- see `RegridMapping`'s docstring for why this is
+        split out from `apply()`/`__call__()`."""
+        query = np.stack([dst_lat.ravel(), dst_lon.ravel() * self.lon_scale], axis=-1)
+        dist_deg, idx = self.tree.query(query)
+        dist_km = dist_deg * KM_PER_DEG_LAT
+        invalid = (dist_km > self.max_dist_km).reshape(dst_lat.shape)
+        return RegridMapping(idx=idx, invalid=invalid, dst_shape=dst_lat.shape)
+
+    def apply(
+        self, src_data: np.ndarray, mapping: RegridMapping, fill_value: float = np.nan
+    ) -> np.ndarray:
+        """`src_data` has shape (..., *src_shape); returns shape (..., *mapping.dst_shape)."""
+        flat = src_data.reshape(*src_data.shape[: -len(self.src_shape)], -1)
+        out = flat[..., mapping.idx]
+        out = out.reshape(*out.shape[:-1], *mapping.dst_shape)
+        out = np.where(mapping.invalid, fill_value, out)
+        return out
+
     def __call__(
         self,
         src_data: np.ndarray,
@@ -69,15 +109,8 @@ class NearestNeighborRegridder:
         dst_lon: np.ndarray,
         fill_value: float = np.nan,
     ) -> np.ndarray:
-        """`src_data` has shape (..., *src_shape); returns shape (..., *dst_lat.shape)."""
-        query = np.stack([dst_lat.ravel(), dst_lon.ravel() * self.lon_scale], axis=-1)
-        dist_deg, idx = self.tree.query(query)
-        dist_km = dist_deg * KM_PER_DEG_LAT
-
-        flat = src_data.reshape(*src_data.shape[: -len(self.src_shape)], -1)
-        out = flat[..., idx]
-        out = out.reshape(*out.shape[:-1], *dst_lat.shape)
-
-        invalid = (dist_km > self.max_dist_km).reshape(dst_lat.shape)
-        out = np.where(invalid, fill_value, out)
-        return out
+        """One-shot convenience path -- recomputes the mapping every call.
+        Prefer `prepare()` once + `apply()` per array when regridding several
+        arrays onto the SAME (dst_lat, dst_lon) (e.g. multiple timesteps of
+        one sample's one source, see RainPro8Dataset.__getitem__)."""
+        return self.apply(src_data, self.prepare(dst_lat, dst_lon), fill_value)

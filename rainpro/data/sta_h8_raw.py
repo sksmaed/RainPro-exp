@@ -7,9 +7,9 @@ the source directory is read-only, and even a compressed *full-frame* year
 would be several hundred GB to a few TB (per the reference conversion
 project below), far past a typical local/home quota. This module's
 `open_sta_h8_raw()` reads `.btp` files directly and on demand instead,
-wrapped in a lazy dask-backed `xr.Dataset` so `RainPro8Dataset._read_frame`'s
-`ds.sel(time=..., method="nearest", tolerance=...)` / `frame_ds[var].values`
-code path works unmodified against it. Each `.values` access triggers
+wrapped in a lazy dask-backed `xr.Dataset` so `RainPro8Dataset._read_source`'s
+time lookup / `ds[var].isel(time=...).values` code path works unmodified
+against it. Each `.values` access triggers
 exactly one `.btp` file read (per band, per timestep actually requested),
 not an eager load of the archive -- this makes it usable with zero
 preprocessing, but at training time it means re-reading full 2750x2750

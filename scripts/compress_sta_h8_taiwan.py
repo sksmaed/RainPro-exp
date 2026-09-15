@@ -40,9 +40,8 @@ warning, not adjusted automatically, since the box was given explicitly.
 
 Output schema matches `sta_h8_raw.open_sta_h8_raw()`'s in-memory `xr.Dataset`
 exactly (one (time, y, x) float32 variable per band B08..B16, plus static
-(y, x) `lat`/`lon` coords) so `RainPro8Dataset._read_frame`'s
-`ds.sel(time=..., method="nearest", tolerance=...)` / `frame_ds[var].values`
-code path needs no changes to consume it.
+(y, x) `lat`/`lon` coords) so `RainPro8Dataset._read_source`'s time lookup /
+`ds[var].isel(time=...).values` code path needs no changes to consume it.
 
 Missing / bad data handling (STA_H8 has no documented missing-value sentinel,
 unlike QPESUMS' -999/-99 -- see `rainpro8_sources.QPESUMS_MISSING_VALUES` --

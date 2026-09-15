@@ -3,6 +3,7 @@ from typing import Literal
 
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.plugins.environments import SLURMEnvironment
 
 from rainpro.callbacks.factory import create_callbacks
 
@@ -22,6 +23,8 @@ class RainProTrainer(pl.Trainer):
         num_animations: int | None = 20,
         animation_bounds: list[float] | None = None,
         callbacks: list[pl.Callback] | pl.Callback | None = None,
+        auto_requeue: bool = False,
+        checkpoint_interval_minutes: float | None = 30,
         **kwargs,
     ):
         _logger = WandbLogger(name=run_name, project=project)
@@ -31,7 +34,26 @@ class RainProTrainer(pl.Trainer):
             early_stopping_patience,
             num_animations,
             animation_bounds,
+            checkpoint_interval_minutes,
         )
+
+        # When launched under `srun` inside an sbatch script, Lightning
+        # auto-detects SLURMEnvironment() with its own default
+        # (auto_requeue=True) unless a `ClusterEnvironment` is passed via
+        # `plugins` explicitly -- that default is what prints "SLURM
+        # auto-requeueing enabled. Setting signal handlers." in the job's
+        # .err log and installs SIGUSR1/SIGTERM handlers that checkpoint and
+        # `scontrol requeue` the job automatically near the time limit.
+        # `auto_requeue=False` here opts out (a plain SLURM job timeout/kill
+        # with no automatic resubmission); pass `auto_requeue=True` (or your
+        # own `plugins=`) to restore Lightning's default behavior. Only
+        # constructed when actually running under Slurm (`SLURMEnvironment.
+        # detect()`) and only if the caller hasn't already supplied `plugins`
+        # themselves, so this doesn't affect non-Slurm (local/dev) runs or
+        # override an explicit `--trainer.plugins`.
+        plugins = kwargs.pop("plugins", None)
+        if plugins is None and SLURMEnvironment.detect():
+            plugins = [SLURMEnvironment(auto_requeue=auto_requeue)]
 
         super().__init__(
             default_root_dir=root_dir,
@@ -43,5 +65,6 @@ class RainProTrainer(pl.Trainer):
             precision=precision,
             gradient_clip_val=gradient_clip_val,
             logger=_logger,
+            plugins=plugins,
             **kwargs,
         )

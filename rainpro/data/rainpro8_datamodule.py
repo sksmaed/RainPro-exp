@@ -171,7 +171,7 @@ class RainPro8DataModule(LightningDataModule):
         # radar-coverage case above, this isn't a "some fraction missing"
         # situation but whole init_times where *every* `satellite_8km` offset
         # would silently come back as `fill_value` (see `RainPro8Dataset.
-        # _read_frame`'s `except KeyError` branch). Drop those init_times
+        # _read_source`'s out-of-tolerance branch). Drop those init_times
         # instead of training on satellite input that's entirely padding.
         # `sta_h8_path` is a comma-separated list (usually length 1) of either
         # raw STA_H8 directory roots (read straight from `.btp` files,

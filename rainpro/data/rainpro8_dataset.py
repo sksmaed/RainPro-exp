@@ -29,7 +29,7 @@ from torch.utils.data import Dataset
 
 from rainpro.data import sta_h8_raw
 from rainpro.data.normalize import DEFAULT_NORM_BOUNDS, minmax_normalize
-from rainpro.data.regrid import NearestNeighborRegridder, target_grid
+from rainpro.data.regrid import NearestNeighborRegridder, RegridMapping, target_grid
 from rainpro.data.rainpro8_sources import SourceSpec
 
 # Which zarr store (key into `data_root`) each source is read from.
@@ -263,76 +263,117 @@ class RainPro8Dataset(Dataset):
             ds = self._get_store(store_key)
             regridder = self._get_regridder(store_key)
             dst_lat, dst_lon = target_grid(center_lat, center_lon, spec.size_km, spec.resolution_km)
+            # Computed once per (sample, source), not once per offset: every
+            # offset of one source regrids onto the SAME destination grid
+            # (`dst_lat`/`dst_lon` don't vary with `offset_min`), so the
+            # nearest-neighbor `cKDTree.query()` behind it is pure repeated
+            # work otherwise -- up to 36x over for target_2km's offsets, 7x
+            # for radar_4km's, 2x for satellite_8km's. See `RegridMapping`'s
+            # docstring in rainpro/data/regrid.py.
+            mapping = regridder.prepare(dst_lat, dst_lon)
 
             is_target = name == "target_2km"
-            frames = [
-                self._read_frame(
-                    ds,
-                    store_key,
-                    regridder,
-                    spec,
-                    init_time,
-                    offset,
-                    dst_lat,
-                    dst_lon,
-                    keep_nan=is_target,
-                    normalize=not is_target,
-                )
-                for offset in spec.offsets_min
-            ]
             # (T, C, H, W). GT is raw QPESUMS max dBZ (see
             # docs/rainpro_tw_implementation_notes.md) -- no Marshall-Palmer
             # conversion in the data path; `rainpro.data.marshall_palmer` is
             # for post-hoc relabeling only (e.g. `rainpro.metrics.probabilistic.CRPS`).
-            arr = np.stack(frames, axis=0)
+            arr = self._read_source(
+                ds,
+                store_key,
+                regridder,
+                mapping,
+                spec,
+                init_time,
+                keep_nan=is_target,
+                normalize=not is_target,
+            )
 
             sample[name] = torch.from_numpy(arr).float()
 
         return sample
 
-    def _load_var(
-        self, store_key: str, frame_ds: xr.Dataset, raw_name: str, is_static: bool
-    ) -> np.ndarray:
-        """Raw (unmasked) ndarray for one variable of one resolved frame, via
-        `self._frame_cache` (see its docstring in `__init__`). Missing-value
-        masking is deliberately NOT done here -- it stays in the caller, applied
-        fresh on every call, since it's cheap (pure in-memory numpy) and, unlike
-        the raw load, isn't safe to treat as invariant across callers in general.
-        """
-        if is_static:
-            cache_key = (store_key, raw_name, None)
-        else:
-            # Keyed by the timestamp `.sel(..., method="nearest")` actually
-            # resolved to, not the query time -- two different query offsets
-            # that snap to the same underlying frame must hit the same cache
-            # entry. `.item()` on a 0-d datetime64 array gives a hashable int.
-            cache_key = (store_key, raw_name, frame_ds["time"].values.item())
-
-        cached = self._frame_cache.get(cache_key)
-        if cached is not None:
-            self._frame_cache.move_to_end(cache_key)
-            return cached
-
-        data = np.asarray(frame_ds[raw_name].values, dtype=np.float32)
-        self._frame_cache[cache_key] = data
+    def _cache_put(self, key: tuple, value: np.ndarray) -> None:
+        self._frame_cache[key] = value
+        self._frame_cache.move_to_end(key)
         if len(self._frame_cache) > self._frame_cache_size:
             self._frame_cache.popitem(last=False)
-        return data
 
-    def _read_frame(
+    def _load_frames(
+        self, store_key: str, ds: xr.Dataset, raw_name: str, positions: np.ndarray | None
+    ) -> list[np.ndarray]:
+        """Source-resolution arrays for one variable at `positions` (integer,
+        sorted, unique indices into the store's time axis), or a one-element
+        list when `positions is None` (a variable with no time dimension).
+
+        Every cache-missing position is fetched in ONE `isel`, so dask/zarr
+        can issue those chunk reads concurrently, rather than one blocking
+        read per timestep. That round-trip count is the point: `target_2km`
+        alone asks for 36 offsets, and against a shared network filesystem
+        (this project's stores live on HFS, not node-local NVMe) it's the
+        per-chunk latency, not the bandwidth, that dominates -- 36 serialized
+        round-trips per sample per variable before this.
+
+        Caching is per (store, variable, position). It's near-worthless for
+        the shuffled train split -- two of one worker's samples landing within
+        each other's offset window is a <0.1% event there -- but a large win
+        for val/test, which iterate in time order (`shuffle=False`), where
+        consecutive `target_2km` samples overlap in 35 of their 36 offsets.
+        """
+        if positions is None:
+            key = (store_key, raw_name, None)
+            cached = self._frame_cache.get(key)
+            if cached is not None:
+                self._frame_cache.move_to_end(key)
+                return [cached]
+            data = np.asarray(ds[raw_name].values, dtype=np.float32)
+            self._cache_put(key, data)
+            return [data]
+
+        frames: list[np.ndarray | None] = [None] * len(positions)
+        missing_pos: list[int] = []
+        missing_slots: list[int] = []
+        for i, pos in enumerate(positions):
+            key = (store_key, raw_name, int(pos))
+            cached = self._frame_cache.get(key)
+            if cached is None:
+                missing_pos.append(int(pos))
+                missing_slots.append(i)
+            else:
+                self._frame_cache.move_to_end(key)
+                frames[i] = cached
+
+        if missing_pos:
+            block = np.asarray(ds[raw_name].isel(time=missing_pos).values, dtype=np.float32)
+            for j, slot in enumerate(missing_slots):
+                # `block[j]` is a view onto the whole fetched block, so caching
+                # it as-is would keep every *other* frame in that block alive
+                # too -- the LRU's entry count would stop bounding real memory.
+                frame = block[j].copy()
+                frames[slot] = frame
+                self._cache_put((store_key, raw_name, missing_pos[j]), frame)
+
+        return frames  # type: ignore[return-value]
+
+    def _read_source(
         self,
         ds: xr.Dataset,
         store_key: str,
         regridder: NearestNeighborRegridder,
+        mapping: RegridMapping,
         spec: SourceSpec,
         init_time: np.datetime64,
-        offset_min: int,
-        dst_lat: np.ndarray,
-        dst_lon: np.ndarray,
         keep_nan: bool = False,
         normalize: bool = True,
     ) -> np.ndarray:
-        """Returns (C, H, W) for one timestep of one source.
+        """Returns (T, C, H, W) for one source: every offset in
+        `spec.offsets_min`, every channel, regridded onto `mapping`.
+
+        All of a variable's offsets are resolved and fetched together (see
+        `_load_frames`) instead of one blocking `.sel(time=..., method=
+        "nearest")` per offset. Offsets with no timestep within tolerance
+        (e.g. a sensor outage) come back as -1 from `get_indexer` and are left
+        as NaN here, matching the per-offset `except KeyError` branch this
+        replaced.
 
         `normalize=False` (used for `target_2km`) bypasses `minmax_normalize`
         entirely, regardless of whether the variable name happens to collide
@@ -346,45 +387,63 @@ class RainPro8Dataset(Dataset):
         entirely) run through `dbz_to_mmh` a second time on that already-
         normalized value -- see `docs/rainpro_tw_implementation_notes.md`.
         """
-        all_vars = list(spec.variables) + list(spec.variables_3d)
-        raw_names = [self.variable_aliases.get(v, v) for v in all_vars]
+        raw_names = [
+            self.variable_aliases.get(v, v)
+            for v in list(spec.variables) + list(spec.variables_3d)
+        ]
         # A source is "static" if none of its variables actually carry a time
         # dimension in the store, even if the store also holds other,
         # time-varying variables. Static sources skip time selection entirely.
         is_static = not any("time" in ds[n].dims for n in raw_names)
 
+        n_times = len(spec.offsets_min)
+        out = np.full((n_times, spec.channels, *mapping.dst_shape), np.nan, dtype=np.float32)
+
         if is_static:
-            frame_ds = ds
+            positions = None
+            # every offset reads the same (only) frame
+            slots = np.zeros(n_times, dtype=int)
         else:
-            query_time = init_time + np.timedelta64(offset_min, "m")
-            try:
-                frame_ds = ds.sel(time=query_time, method="nearest", tolerance=_tolerance(spec))
-            except KeyError:
-                # No timestep within tolerance (e.g. sensor outage): treat as missing.
-                out = np.full((spec.channels, *dst_lat.shape), np.nan, dtype=np.float32)
+            query_times = pd.DatetimeIndex(
+                [pd.Timestamp(init_time + np.timedelta64(o, "m")) for o in spec.offsets_min]
+            )
+            found_at = ds.indexes["time"].get_indexer(
+                query_times, method="nearest", tolerance=_tolerance(spec)
+            )
+            within = found_at >= 0  # -1 == nothing within tolerance
+            if not within.any():
                 return out if keep_nan else np.where(np.isnan(out), self.fill_value, out)
+            positions, inverse = np.unique(found_at[within], return_inverse=True)
+            slots = np.full(n_times, -1, dtype=int)
+            slots[within] = inverse
 
-        channels = []
-        for var in spec.variables:
-            raw_name = self.variable_aliases.get(var, var)
-            data = self._load_var(store_key, frame_ds, raw_name, is_static)
-            data = _mask_missing(data, spec.missing_values)
-            regridded = regridder(data, dst_lat, dst_lon, fill_value=np.nan)
-            if normalize:
-                regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
-            channels.append(regridded)
+        per_var_frames = [
+            self._load_frames(store_key, ds, raw_name, positions) for raw_name in raw_names
+        ]
+        n_2d = len(spec.variables)
+        n_levels = len(spec.levels)
 
-        for var in spec.variables_3d:
-            raw_name = self.variable_aliases.get(var, var)
-            data = self._load_var(store_key, frame_ds, raw_name, is_static)  # (level, y, x)
-            data = data[list(spec.levels)]
-            data = _mask_missing(data, spec.missing_values)
-            regridded = regridder(data, dst_lat, dst_lon, fill_value=np.nan)
-            if normalize:
-                regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
-            channels.extend(regridded)
+        for t_idx, slot in enumerate(slots):
+            if slot < 0:
+                continue  # no timestep within tolerance -- stays NaN
+            channel = 0
+            for var_idx, var in enumerate(spec.variables):
+                data = _mask_missing(per_var_frames[var_idx][slot], spec.missing_values)
+                regridded = regridder.apply(data, mapping, fill_value=np.nan)
+                if normalize:
+                    regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
+                out[t_idx, channel] = regridded
+                channel += 1
 
-        out = np.stack(channels, axis=0)
+            for var_idx, var in enumerate(spec.variables_3d):
+                data = per_var_frames[n_2d + var_idx][slot]  # (level, y, x)
+                data = _mask_missing(data[list(spec.levels)], spec.missing_values)
+                regridded = regridder.apply(data, mapping, fill_value=np.nan)
+                if normalize:
+                    regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
+                out[t_idx, channel : channel + n_levels] = regridded
+                channel += n_levels
+
         if not keep_nan:
             out = np.where(np.isnan(out), self.fill_value, out)
         return out

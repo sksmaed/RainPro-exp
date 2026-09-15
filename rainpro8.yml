@@ -94,9 +94,22 @@ data:
   # instead of re-forking (and, on the raw STA_H8 fallback path, re-walking
   # the whole source tree) every single epoch.
   prefetch_factor: 4
-  frame_cache_size: 64 # per-worker LRU cache of raw (pre-regrid) source frames,
-  # keyed by (store, variable, resolved timestamp) -- dedupes repeat reads of
-  # the same underlying frame across samples whose offset windows overlap
-  # (e.g. satellite_8km's hourly frames, shared by every 10-min target sample
-  # within that hour). Raise if you have RAM to spare and see cache misses
-  # dominating; each entry is one (H, W) float32 source-resolution frame.
+  frame_cache_size: 128 # per-worker LRU cache of raw (pre-regrid) source frames,
+  # keyed by (store, variable, time position). Sized as "two samples of
+  # lookback": one obs-only sample touches 62 frames (target_2km 36 +
+  # radar_4km 7 + radar_8km 1 + satellite_8km 2x9), so 128 is the smallest
+  # value that keeps a whole previous sample resident. Below ~124 the second
+  # sample of a batch evicts the first one's frames before it can reuse them.
+  #
+  # This only pays off where consecutive samples are close in time, i.e.
+  # val/test (`shuffle=False`, so the 2 samples in a batch are 10 min apart
+  # and share 35 of their 36 target_2km frames). The train split is shuffled,
+  # where two samples landing in each other's offset window is a <0.1% event
+  # -- expect no train-side benefit from this.
+  #
+  # Memory per worker: entry count, not bytes, is what's bounded. A QPESUMS
+  # frame is 561x441 float32 ~= 0.94 MiB, an STA_H8 (cropped) frame
+  # 1167x1274 ~= 5.67 MiB. At 128 entries in the usual ~44:18 QPESUMS:STA_H8
+  # mix that's ~300 MiB/worker; all-satellite worst case is ~725 MiB/worker.
+  # Multiply by num_workers (and remember persistent_workers=true holds it for
+  # the whole run) before raising this further.
