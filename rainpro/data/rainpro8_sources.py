@@ -45,9 +45,22 @@ Tier = str  # "target_2km" | "4km" | "8km" | "16km"
 
 STA_H8_BANDS = [f"B{i:02d}" for i in range(8, 17)]  # B08..B16, 9 IR bands
 
-# QPESUMS' documented missing-value sentinels (docs/rainpro_dataset.md); confirmed
-# present in the real store (e.g. -99.0 around Taiwan's coastline/coverage edge).
-QPESUMS_MISSING_VALUES: tuple[float, ...] = (-999.0, -99.0)
+# QPESUMS' documented sentinels (docs/rainpro_dataset.md), split by what they
+# actually MEAN, which is not the same thing:
+#
+#   -999  genuinely unobserved -> NaN -> excluded from the loss.
+#   -99   NO ECHO, i.e. a real observation of "nothing above the radar's
+#         detection threshold here" -> 0 dBZ, a valid low-reflectivity target.
+#
+# -99 was in the missing list originally, which made ~98% of every frame NaN
+# (measured: 98.4% of pixels in the real store) and so threw away essentially
+# all of the "it is not raining here" signal -- the only thing teaching the
+# model NOT to paint echo everywhere. It is weather-dependent, not a static
+# coverage mask: the -99 footprint of two timestamps years apart agrees on only
+# 87.6% of pixels, and it visibly tracks the moving echo, which is what settles
+# it as "no echo" rather than "out of radar range".
+QPESUMS_MISSING_VALUES: tuple[float, ...] = (-999.0,)
+QPESUMS_NO_ECHO_VALUES: tuple[float, ...] = (-99.0,)
 
 # Paper App. I (Table 11): the 122 `gfs_16km` channels kept from the full GFS
 # field set, flattened to one canonical name per (variable, level) pair --
@@ -117,12 +130,19 @@ class SourceSpec:
     variables_3d: Sequence[str] = ()  # level-resolved variables, see `levels`
     levels: Sequence[int] = ()  # pressure levels shared by all `variables_3d`
     fill_value: float = 0.0
-    # Raw sentinel values (e.g. QPESUMS' -999/-99, see docs/rainpro_dataset.md)
-    # that mark missing data in the *source* store and must be masked to NaN
-    # before clipping/normalizing -- otherwise they're indistinguishable from
-    # real physical values (e.g. -999 dBZ clipped into DBZ_RANGE) and, for
+    # Raw sentinel values (e.g. QPESUMS' -999, see docs/rainpro_dataset.md)
+    # marking data that was never observed. Masked to NaN before any
+    # clipping/normalizing -- otherwise they're indistinguishable from real
+    # physical values (e.g. -999 dBZ clipped into DBZ_RANGE) and, for
     # `target_2km` specifically, flow straight into the loss/metrics unmasked.
     missing_values: Sequence[float] = ()
+    # Raw sentinel values that mean "observed, and there is nothing here"
+    # (QPESUMS' -99). These are NOT missing: replaced with `no_echo_fill` in
+    # the source's own units, so they stay real supervision -- the negative
+    # examples that stop the model painting echo over clear sky. See
+    # `QPESUMS_NO_ECHO_VALUES` above for why -99 is this and not missing.
+    no_echo_values: Sequence[float] = ()
+    no_echo_fill: float = 0.0
 
     @property
     def size_px(self) -> int:
@@ -181,6 +201,7 @@ def build_taiwan_sources(
             offsets_min=tuple(range(10, 370, 10)),  # 0-6h @ 10 min, 36 steps
             variables=("max_dbz",),
             missing_values=QPESUMS_MISSING_VALUES,
+            no_echo_values=QPESUMS_NO_ECHO_VALUES,
         ),
         "radar_4km": SourceSpec(
             name="radar_4km",
@@ -190,6 +211,7 @@ def build_taiwan_sources(
             offsets_min=tuple(range(-60, 10, 10)),  # -60..0 min, 7 steps
             variables=("max_dbz",),
             missing_values=QPESUMS_MISSING_VALUES,
+            no_echo_values=QPESUMS_NO_ECHO_VALUES,
         ),
         "radar_8km": SourceSpec(
             name="radar_8km",
@@ -199,6 +221,7 @@ def build_taiwan_sources(
             offsets_min=(0,),
             variables=("max_dbz",),
             missing_values=QPESUMS_MISSING_VALUES,
+            no_echo_values=QPESUMS_NO_ECHO_VALUES,
         ),
     }
 

@@ -143,7 +143,17 @@ class OrdinalConsistentLoss(torch.nn.Module):
         preds: torch.Tensor,
         targets: torch.Tensor,
     ) -> torch.Tensor:
-        nan_mask = targets == self.no_data_value  # B, T, 1, H, W
+        # `self.no_data_value` is the CLASS INDEX `Bucketize` assigns to NaN
+        # (== len(buckets)), not a value in the target's own units -- comparing
+        # raw targets against it, as this did before, never matches (`nan == 16`
+        # is False), so no-data pixels fell through unmasked. They then
+        # bucketize to `no_data_value`, which makes `targets_encoded` all-ones
+        # and `sets_mask` all-True: every channel supervised toward "exceeds
+        # every threshold", i.e. the model is explicitly trained to predict
+        # MAXIMUM reflectivity wherever the radar reported nothing. Dormant on
+        # SEVIR (dense rasters, no NaN); catastrophic on QPESUMS, whose
+        # missing-value sentinels become NaN in `RainPro8Dataset`.
+        nan_mask = torch.isnan(targets)  # B, T, 1, H, W
         targets = targets.contiguous()
         targets = self.bucketize(targets)
         targets_encoded = (self.range_tensor <= targets).to(dtype=preds.dtype)

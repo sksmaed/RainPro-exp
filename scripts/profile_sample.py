@@ -75,6 +75,7 @@ def instrument() -> None:
     NearestNeighborRegridder.prepare = timed("regrid prepare (cKDTree query)", NearestNeighborRegridder.prepare)
     NearestNeighborRegridder.apply = timed("regrid apply (gather)", NearestNeighborRegridder.apply)
     ds_mod._mask_missing = timed("mask missing values", ds_mod._mask_missing)
+    ds_mod._fill_no_echo = timed("fill no-echo sentinels", ds_mod._fill_no_echo)
     ds_mod.minmax_normalize = timed("normalize", ds_mod.minmax_normalize)
 
 

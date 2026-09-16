@@ -77,3 +77,67 @@ Tail 假設（codebase 其他地方都沒寫，這裡明確講）：低於第一
 | MAE / MSE | **會變**，直接在 dBZ 數值軸上算，不換算——尚未有需求要求換算回 mm/h |
 
 **對 B/C 主實驗完全無影響**——三臂共用同一 GT 定義，相對比較的效力不受任何影響。
+
+## QPESUMS -99 的語意錯置 + loss 的 NaN 遮罩失效（兩個連動的 bug，已修）
+
+### 症狀
+
+推論視覺化時，模型在**沒有回波的整片背景**輸出 60 dBZ（色階頂端），而且深紅區域精準對應 GT 的
+NaN 區域。
+
+### 根因一：loss 的 `nan_mask` 比對錯對象
+
+`OrdinalConsistentLoss.forward` 原本：
+
+```python
+nan_mask = targets == self.no_data_value   # ← 在 bucketize 之前，用原始 dBZ 比對
+targets = self.bucketize(targets)          # ← NaN 在這一行才變成 class 16
+```
+
+`no_data_value` 是 `Bucketize` 指派給 NaN 的**類別索引**（`= len(buckets) = 16`），不是 dBZ
+值。拿原始 dBZ 去比對它（`nan == 16`）永遠是 False，所以缺測像素從未被標記。接著
+`bucketize` 把它變成 class 16 → `targets_encoded` 全為 1 → `sets_mask` 全為 True →
+**16/16 個 channel 都被監督成「超過所有門檻」，即模型被明確訓練成「沒有資料的地方就輸出最大回波」**。
+
+上游 SEVIR 版本同樣有這個順序問題，但 SEVIR 的 raster 沒有 NaN，所以一直是休眠的；台灣版因為
+QPESUMS 用哨兵值表示缺測而引爆。
+
+修法：`nan_mask = torch.isnan(targets)`。
+
+### 根因二：-99 被當成缺測，但它其實是「無回波」
+
+見 `docs/rainpro_dataset.md` 的 QPESUMS 段落。`QPESUMS_MISSING_VALUES` 原本包含 -99，使得
+**98.4% 的像素變成 NaN**，等於丟掉幾乎全部「這裡沒有下雨」的負樣本。
+
+判定依據（三項獨立證據）：
+
+1. -99 的遮罩隨天氣變化 —— 相隔數年的兩個時間點只有 **87.6%** 重疊
+2. 推論圖上 GT 的非 NaN 區域形狀會跟著回波移動，不是固定的地理遮罩
+3. 論文 Table 8：訓練集 **79.64%** 的像素落在最低的「無雨」bucket 且**是有監督的類別**，
+   missing 僅 **12.97%**。把 -99 當缺測會讓台灣版 missing 變成 98.4%，與論文設計不符
+
+修法：`SourceSpec` 新增 `no_echo_values` / `no_echo_fill`，把哨兵值依語意拆開：
+
+| 哨兵值 | 語意 | 處理 |
+|---|---|---|
+| -999 | 真正未觀測 | → NaN → 排除於 loss |
+| -99 | 無回波（有觀測） | → 0 dBZ → class -1 → 監督 `P(Y > 5 dBZ) = 0` |
+
+### 為什麼必須兩個一起修
+
+| target 像素 | 修之前 | 只修根因一 | 兩個都修 |
+|---|---|---|---|
+| -99（98.4%） | 訓練成 60 dBZ | 被排除，無梯度 | 訓練成「無回波」✅ |
+| -999 | 訓練成 60 dBZ | 排除 ✅ | 排除 ✅ |
+| 30 dBZ | 7/16 channels | 7/16 ✅ | 7/16 ✅ |
+
+只修根因一的話，模型只會在 1.6%（全是有回波）的像素上訓練，從「被教成最大回波」變成
+「沒學過哪裡不下雨」，一樣會到處長回波。
+
+### 影響範圍
+
+- **所有在此修正前訓練出的 checkpoint 全部作廢**，必須重練
+- **舊的 val/test 指標不能與新的比較**：先前 CSI/FSS/CRPS/Brier 的分母只涵蓋非 NaN 的像素
+  （約 1.6% 的畫面），修正後涵蓋整個 canvas，數字的意義完全不同
+- 輸入端（`radar_4km` / `radar_8km`）幾乎不受影響：-99 原本走 NaN → `fill_value=0.0`，
+  修正後走 0 dBZ → `minmax_normalize` 後為 0.0154（`DBZ_RANGE = (-1, 64)`），差異可忽略

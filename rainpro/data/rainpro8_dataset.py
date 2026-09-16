@@ -428,7 +428,10 @@ class RainPro8Dataset(Dataset):
                 continue  # no timestep within tolerance -- stays NaN
             channel = 0
             for var_idx, var in enumerate(spec.variables):
-                data = _mask_missing(per_var_frames[var_idx][slot], spec.missing_values)
+                data = _fill_no_echo(
+                    per_var_frames[var_idx][slot], spec.no_echo_values, spec.no_echo_fill
+                )
+                data = _mask_missing(data, spec.missing_values)
                 regridded = regridder.apply(data, mapping, fill_value=np.nan)
                 if normalize:
                     regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
@@ -437,7 +440,10 @@ class RainPro8Dataset(Dataset):
 
             for var_idx, var in enumerate(spec.variables_3d):
                 data = per_var_frames[n_2d + var_idx][slot]  # (level, y, x)
-                data = _mask_missing(data[list(spec.levels)], spec.missing_values)
+                data = _fill_no_echo(
+                    data[list(spec.levels)], spec.no_echo_values, spec.no_echo_fill
+                )
+                data = _mask_missing(data, spec.missing_values)
                 regridded = regridder.apply(data, mapping, fill_value=np.nan)
                 if normalize:
                     regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
@@ -447,6 +453,22 @@ class RainPro8Dataset(Dataset):
         if not keep_nan:
             out = np.where(np.isnan(out), self.fill_value, out)
         return out
+
+
+def _fill_no_echo(data: np.ndarray, no_echo_values: Sequence[float], fill: float) -> np.ndarray:
+    """Replace "observed, nothing here" sentinels (QPESUMS' -99) with a real
+    low value rather than NaN.
+
+    These are the opposite of `_mask_missing`'s values despite looking the
+    same: they're the negative examples -- ~98% of a QPESUMS frame -- and
+    masking them out is what left the model with nothing teaching it where
+    rain ISN'T. See `rainpro8_sources.QPESUMS_NO_ECHO_VALUES`."""
+    if not no_echo_values:
+        return data
+    mask = np.zeros(data.shape, dtype=bool)
+    for value in no_echo_values:
+        mask |= np.isclose(data, value)
+    return np.where(mask, fill, data)
 
 
 def _mask_missing(data: np.ndarray, missing_values: Sequence[float]) -> np.ndarray:
