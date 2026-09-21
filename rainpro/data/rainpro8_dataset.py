@@ -63,6 +63,34 @@ TIME_TOLERANCE = {
 DEFAULT_LATLON_CANDIDATES = [("lat", "lon"), ("XLAT", "XLONG"), ("latitude", "longitude")]
 
 
+def _open_store(path: str, consolidated: bool) -> xr.Dataset:
+    """`chunks=None` is the point: it opens the store through xarray's own lazy
+    indexing instead of wrapping every array in dask.
+
+    Training reads are small, explicitly indexed and synchronous -- 62 frames a
+    sample, one chunk each -- and dask charged ~24 ms of per-chunk scheduler and
+    graph-construction overhead on top of ~0.6 ms of real read+decompress.
+    Measured on the real stores (`scripts/profile_training_pipeline.py
+    --sections readpath`), reading 36 QPESUMS frames:
+
+        xarray + dask            0.5685 s
+        xarray, chunks=None      0.0224 s   (25.4x)
+        zarr array directly      0.0229 s   (24.9x)
+
+    That `chunks=None` ties reading the zarr arrays directly is what says the
+    whole difference was dask rather than anything in the storage layer -- and
+    a page-cache test (re-running identical reads) had already ruled out
+    filesystem latency, while the cost being flat in *chunks* rather than bytes
+    ruled out decompression.
+
+    Dask also spawns a thread pool sized by `os.cpu_count()`, which on a SLURM
+    node reports the whole machine rather than the cgroup's allocation: with
+    `num_workers=11` that was ~1000 threads contending for 12 cores, the likely
+    source of the multi-second p95 stalls seen in a real fit.
+    """
+    return xr.open_zarr(path, consolidated=consolidated, chunks=None)
+
+
 def _is_zarr_store(path: str) -> bool:
     """A zarr v3 group root has a `zarr.json` directly under it; a raw STA_H8
     directory tree (nested `YYYY/MM/DD/.../*.btp`) never does."""
@@ -79,6 +107,101 @@ def split_sta_h8_paths(data_root_value: str) -> list[str]:
     rainpro8.yml (jsonargparse deep-merges dict-typed CLI params; a
     list-typed value would just make that worse, not better)."""
     return [p.strip() for p in data_root_value.split(",") if p.strip()]
+
+
+class _StoreHandle:
+    """One logical store, backed by one or more zarr datasets.
+
+    Exists to keep two things that used to be in tension:
+
+    * The stores are opened with `chunks=None`, i.e. NOT dask-backed. Dask was
+      costing ~24 ms of scheduler and graph-construction overhead per chunk
+      against ~0.6 ms of actual read+decompress -- 25x on the QPESUMS reads
+      that dominate a sample (measured, `scripts/profile_training_pipeline.py
+      --sections readpath`). Every read here is a small, explicitly indexed,
+      synchronous fetch, which is exactly the shape dask is worst at.
+    * STA_H8 can be split across several stores (one per quarter, possibly on
+      different filesystems -- see `scripts/compress_sta_h8_taiwan.py --freq
+      quarter`, needed because /home and /work are 100 GB each). That used to
+      be `xr.concat(...).sortby("time")`, which is lazy only while the arrays
+      are dask-backed: without dask it would call `np.concatenate` and pull all
+      ~121 GB into memory on the first `_get_store`.
+
+    So instead of concatenating the data, this concatenates only the *time
+    index* and remembers, per global position, which dataset owns it and where.
+    Reads are grouped by owner and issued one `isel` per dataset, which keeps
+    `_load_frames`'s batched-read property intact. A 36-offset window spans 6
+    hours and so normally sits inside one quarter; near a boundary it simply
+    becomes two reads instead of one.
+    """
+
+    def __init__(self, datasets: list[xr.Dataset]):
+        if not datasets:
+            raise ValueError("_StoreHandle needs at least one dataset")
+        self.datasets = datasets
+        # Variable names, dims and lat/lon are identical across the stores of
+        # one source (same crop box, same bands), so inspection can use any.
+        self.primary = datasets[0]
+
+        if len(datasets) == 1:
+            index = datasets[0].indexes.get("time")
+            self.time_index = index if index is not None else pd.DatetimeIndex([])
+            self._owner = None  # single-store fast path: position == local index
+            self._local = None
+            return
+
+        times, owners, locals_ = [], [], []
+        for store_id, ds in enumerate(datasets):
+            index = ds.indexes["time"]
+            times.append(np.asarray(index.values))
+            owners.append(np.full(len(index), store_id, dtype=np.int32))
+            locals_.append(np.arange(len(index), dtype=np.int64))
+        times = np.concatenate(times)
+        # Stable sort so `.get_indexer(..., method="nearest")` -- which requires
+        # a monotonic index -- works regardless of the order the paths were
+        # listed in, exactly as the old `.sortby("time")` guaranteed.
+        order = np.argsort(times, kind="stable")
+        self.time_index = pd.DatetimeIndex(times[order])
+        self._owner = np.concatenate(owners)[order]
+        self._local = np.concatenate(locals_)[order]
+
+    def read(self, raw_name: str, positions: np.ndarray | None) -> np.ndarray:
+        """`(len(positions), ...)` for one variable, or the whole array when
+        `positions is None` (a variable with no time dimension)."""
+        if positions is None:
+            return np.asarray(self.primary[raw_name].values, dtype=np.float32)
+
+        positions = np.asarray(positions)
+        if self._owner is None:
+            return np.asarray(
+                self.datasets[0][raw_name].isel(time=positions.tolist()).values,
+                dtype=np.float32,
+            )
+
+        owners = self._owner[positions]
+        local = self._local[positions]
+        out: np.ndarray | None = None
+        for store_id in np.unique(owners):
+            slots = np.flatnonzero(owners == store_id)
+            # Ascending within the read: zarr's orthogonal indexing is happiest
+            # with sorted selections, and scattering back through `slots[order]`
+            # keeps the caller's ordering exact.
+            order = np.argsort(local[slots], kind="stable")
+            block = np.asarray(
+                self.datasets[store_id][raw_name]
+                .isel(time=local[slots][order].tolist())
+                .values,
+                dtype=np.float32,
+            )
+            if out is None:
+                out = np.empty((len(positions), *block.shape[1:]), dtype=np.float32)
+            out[slots[order]] = block
+        assert out is not None  # `positions` is non-empty by construction
+        return out
+
+    def close(self) -> None:
+        for ds in self.datasets:
+            ds.close()
 
 
 class RainPro8Dataset(Dataset):
@@ -147,13 +270,13 @@ class RainPro8Dataset(Dataset):
         return np.random.default_rng((self.rng_seed, self.epoch, index))
 
     def close(self):
-        for ds in self._datasets.values():
-            ds.close()
+        for handle in self._datasets.values():
+            handle.close()
         self._datasets = {}
 
     # -- lazy zarr access -------------------------------------------------
 
-    def _get_store(self, store_key: str) -> xr.Dataset:
+    def _get_store(self, store_key: str) -> "_StoreHandle":
         if store_key not in self._datasets:
             path = self.data_root.get(store_key)
             if path is None:
@@ -189,52 +312,40 @@ class RainPro8Dataset(Dataset):
                             f"to combine multiple sources"
                         )
                     latlon_path = self.data_root.get("sta_h8_latlon", sta_h8_raw.DEFAULT_LATLON_PATH)
-                    self._datasets[store_key] = sta_h8_raw.open_sta_h8_raw(raw_paths[0], latlon_path)
+                    self._datasets[store_key] = _StoreHandle(
+                        [sta_h8_raw.open_sta_h8_raw(raw_paths[0], latlon_path)]
+                    )
                 else:
                     # scripts/compress_sta_h8_taiwan.py's stores attempt
                     # consolidation but don't guarantee it (best-effort) --
                     # consolidated=False always works, and unconsolidated open
                     # is only marginally slower for the handful of arrays (9
-                    # bands + time/lat/lon) each of these stores has. Multiple
-                    # stores (e.g. one per quarter, possibly on different
-                    # filesystems -- see that script's `--freq quarter`) are
-                    # concatenated along time into one lazy Dataset; `sortby`
-                    # guarantees monotonic time regardless of the order the
-                    # paths were listed in, which `.sel(..., method="nearest")`
-                    # relies on.
+                    # bands + time/lat/lon) each of these stores has.
                     #
-                    # `data_vars="minimal"` is NOT optional here: "lat"/"lon"
-                    # are plain (y, x) data variables in this store (no "time"
-                    # dim, and nothing marks them as coords -- see
-                    # scripts/compress_sta_h8_taiwan.py's `create_array` calls),
-                    # so `xr.concat`'s default `data_vars="all"` broadcasts
-                    # them along the NEW "time" dim too, i.e. duplicates each
-                    # ~6 MB (y, x) array once per timestep (thousands of times)
-                    # instead of keeping the one (y, x) array every quarter
-                    # already shares (same crop box) -- verified this OOM-kills
-                    # a concat of just 2 small test stores. "minimal" only
-                    # concatenates variables that actually vary along "time"
-                    # (the 9 bands), taking lat/lon from the first dataset as-is.
-                    datasets = [xr.open_zarr(p, consolidated=False) for p in zarr_paths]
-                    ds = (
-                        xr.concat(datasets, dim="time", data_vars="minimal", coords="minimal")
-                        if len(datasets) > 1
-                        else datasets[0]
+                    # Multiple stores (one per quarter, possibly on different
+                    # filesystems -- see that script's `--freq quarter`) are
+                    # NOT concatenated. `_StoreHandle` merges their time indices
+                    # and routes each read to the owning store instead; see its
+                    # docstring for why concatenating is unsafe once the arrays
+                    # stop being dask-backed.
+                    self._datasets[store_key] = _StoreHandle(
+                        [_open_store(p, consolidated=False) for p in zarr_paths]
                     )
-                    self._datasets[store_key] = ds.sortby("time") if len(datasets) > 1 else ds
             else:
-                self._datasets[store_key] = xr.open_zarr(path, consolidated=True)
+                self._datasets[store_key] = _StoreHandle(
+                    [_open_store(path, consolidated=True)]
+                )
         return self._datasets[store_key]
 
     def _get_regridder(self, store_key: str) -> NearestNeighborRegridder:
         if store_key not in self._regridders:
-            ds = self._get_store(store_key)
+            handle = self._get_store(store_key)
             candidates = (
                 [self.latlon_names[store_key]] + DEFAULT_LATLON_CANDIDATES
                 if store_key in self.latlon_names
                 else DEFAULT_LATLON_CANDIDATES
             )
-            lat, lon = _extract_latlon(ds, candidates)
+            lat, lon = _extract_latlon(handle.primary, candidates)
             self._regridders[store_key] = NearestNeighborRegridder(
                 lat, lon, ref_lat=self.center_lat
             )
@@ -260,7 +371,7 @@ class RainPro8Dataset(Dataset):
         sample: dict[str, torch.Tensor] = {}
         for name, spec in self.sources.items():
             store_key = SOURCE_STORE[name]
-            ds = self._get_store(store_key)
+            handle = self._get_store(store_key)
             regridder = self._get_regridder(store_key)
             dst_lat, dst_lon = target_grid(center_lat, center_lon, spec.size_km, spec.resolution_km)
             # Computed once per (sample, source), not once per offset: every
@@ -278,7 +389,7 @@ class RainPro8Dataset(Dataset):
             # conversion in the data path; `rainpro.data.marshall_palmer` is
             # for post-hoc relabeling only (e.g. `rainpro.metrics.probabilistic.CRPS`).
             arr = self._read_source(
-                ds,
+                handle,
                 store_key,
                 regridder,
                 mapping,
@@ -299,7 +410,7 @@ class RainPro8Dataset(Dataset):
             self._frame_cache.popitem(last=False)
 
     def _load_frames(
-        self, store_key: str, ds: xr.Dataset, raw_name: str, positions: np.ndarray | None
+        self, store_key: str, handle: "_StoreHandle", raw_name: str, positions: np.ndarray | None
     ) -> list[np.ndarray]:
         """Source-resolution arrays for one variable at `positions` (integer,
         sorted, unique indices into the store's time axis), or a one-element
@@ -325,7 +436,7 @@ class RainPro8Dataset(Dataset):
             if cached is not None:
                 self._frame_cache.move_to_end(key)
                 return [cached]
-            data = np.asarray(ds[raw_name].values, dtype=np.float32)
+            data = handle.read(raw_name, None)
             self._cache_put(key, data)
             return [data]
 
@@ -343,7 +454,7 @@ class RainPro8Dataset(Dataset):
                 frames[i] = cached
 
         if missing_pos:
-            block = np.asarray(ds[raw_name].isel(time=missing_pos).values, dtype=np.float32)
+            block = handle.read(raw_name, np.asarray(missing_pos))
             for j, slot in enumerate(missing_slots):
                 # `block[j]` is a view onto the whole fetched block, so caching
                 # it as-is would keep every *other* frame in that block alive
@@ -356,7 +467,7 @@ class RainPro8Dataset(Dataset):
 
     def _read_source(
         self,
-        ds: xr.Dataset,
+        handle: "_StoreHandle",
         store_key: str,
         regridder: NearestNeighborRegridder,
         mapping: RegridMapping,
@@ -394,7 +505,7 @@ class RainPro8Dataset(Dataset):
         # A source is "static" if none of its variables actually carry a time
         # dimension in the store, even if the store also holds other,
         # time-varying variables. Static sources skip time selection entirely.
-        is_static = not any("time" in ds[n].dims for n in raw_names)
+        is_static = not any("time" in handle.primary[n].dims for n in raw_names)
 
         n_times = len(spec.offsets_min)
         out = np.full((n_times, spec.channels, *mapping.dst_shape), np.nan, dtype=np.float32)
@@ -407,7 +518,7 @@ class RainPro8Dataset(Dataset):
             query_times = pd.DatetimeIndex(
                 [pd.Timestamp(init_time + np.timedelta64(o, "m")) for o in spec.offsets_min]
             )
-            found_at = ds.indexes["time"].get_indexer(
+            found_at = handle.time_index.get_indexer(
                 query_times, method="nearest", tolerance=_tolerance(spec)
             )
             within = found_at >= 0  # -1 == nothing within tolerance
@@ -418,7 +529,8 @@ class RainPro8Dataset(Dataset):
             slots[within] = inverse
 
         per_var_frames = [
-            self._load_frames(store_key, ds, raw_name, positions) for raw_name in raw_names
+            self._load_frames(store_key, handle, raw_name, positions)
+            for raw_name in raw_names
         ]
         n_2d = len(spec.variables)
         n_levels = len(spec.levels)

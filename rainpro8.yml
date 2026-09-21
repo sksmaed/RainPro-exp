@@ -44,6 +44,15 @@ trainer:
 model:
   class_path: rainpro.modules.rainpro8.RainPro8Module
   init_args:
+    # Paper Sec. 4: 256 channels throughout, 36.7M parameters. The network's
+    # own default (128, 256, 512, 128) measures 82.62M -- see the `dims`
+    # comment in rainpro/modules/rainpro8.py. Stated explicitly here so the
+    # config records the architecture the run actually used.
+    dims: [256, 256, 256, 256]
+    # 3.4x on GPU compute; see `compile_model` in rainpro/modules/rainpro8.py.
+    # Set false if torch.compile misbehaves on your PyTorch/GPU combination --
+    # checkpoints are compatible either way.
+    compile_model: true
     lead_time_decay_ratio: 10.0
     learning_rate: 3.0e-4
     weight_decay: 0.1
@@ -78,7 +87,12 @@ data:
   center_lon: 121.0
   train_jitter_km: 256
   batch_size: 16
-  eval_batch_size: 16
+  # `eval_batch_size` deliberately left unset: `RainPro8DataModule` then falls
+  # back to `batch_size`, so the two stay equal even when only `batch_size` is
+  # overridden on the CLI (`--data.batch_size 4`). That matters now that the
+  # network is `torch.compile`d -- a different eval batch is a different input
+  # shape, so Inductor recompiles the whole graph on entry to every validation
+  # pass, and `check_val_every_n_epoch: 1` means once per epoch.
   # job-375131 ran this at num_workers=16 with `trainer.devices` overridden to
   # 8 GPUs on the CLI -- that's 16*8=128 DataLoader worker *processes* on one
   # node, which on most HPC nodes oversubscribes the CPU (check `nproc`) and,

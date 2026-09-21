@@ -1,64 +1,60 @@
-"""Why is RainPro-8-TW ~8-12x slower per optimizer step than the paper?
+"""Where does a RainPro-8-TW optimizer step go, versus the paper's 0.490 s?
 
 THE NUMBER TO BEAT (docs/rainpro_paper.md:267 and Table 9 at :626):
     100k steps @ batch 16 in 13:36 on 1x H100 SXM5 80GB + 26 vCPUs
-    == 0.49 s / optimizer step == 30.6 ms / sample
+    == 0.490 s / optimizer step == 30.6 ms / sample
 
-MEASURED on 1x H200 (2026-09-21), batch 4 x accum 4, obs-only:
-    fp32 / matmul=highest   3.618 s/step   7.4x the paper   66.1 GiB peak
-    fp32 / matmul=high      3.217 s/step   6.6x            (TF32: only 1.12x)
-    bf16-mixed              3.245 s/step   6.6x            58.0 GiB peak
-    micro-batch 16          OOM on 140 GiB
-    parameters              82.62M vs the paper's 36.7M = 2.25x
+WHAT THIS SCRIPT FOUND (1x H200, batch 4 x accum 4, obs-only, 2026-09-21).
+Each row changed exactly one variable and re-measured:
 
-Read that together: precision buys ~12% and bf16 ties TF32 exactly, so this is
-NOT matmul-bound -- it is bandwidth and activation-size bound. 66 GiB for 4
-samples is 16.5 GiB/sample, while the paper fit 16 samples in 80 GiB (<5
-GiB/sample). Both point at the same place: `dims=(128, 256, 512, 128)` runs the
-MaxViT centre at 512 channels and it holds 78% of the parameters, whereas the
-paper (docs/rainpro_paper.md:153) describes "halving internal channels" from
-MetNet-3 and states "256 channels throughout". `--dims 128 256 256 128` lands
-the parameter count near 36.7M; use `--sections model` to check before retiming.
+    GPU-only s/step                                        peak GiB
+    3.618  dims=(128,256,512,128), fp32            7.4x      66.1
+    3.217  + matmul=high (TF32)                    6.6x      66.1   <- only 1.12x
+    2.325  dims=(256,256,256,256), fp32            4.7x      41.7   <- 82.6M -> 36.7M
+    0.679  + torch.compile                         1.4x      27.0   <- 3.4x
+    0.446  + bf16-mixed                            0.9x      18.4   <- beats the paper
 
-Cross-check on the wall clock: STA_H8 covers ~10.5 months of 2021, so the train
-split is ~37k samples == ~2300 optimizer steps per epoch; at 3.6 s that is 2.3 h
-of pure compute per epoch against the observed "4+ hours", leaving the rest to
-the data pipeline.
+    per-sample data cost
+    2.118  baseline (load_frames 89.9% of it)
+    0.484  projected after chunks=None + store routing (25.4x on QPESUMS reads)
 
-So the gap decomposes as:
-    ~7.4x in GPU compute      <- dominant; mostly channel width, not precision
-    ~2.7x in per-sample CPU   <- real, but overlapped with compute
-An infinitely fast DataLoader still leaves you ~7x short. This profiler is
-therefore weighted toward the compute side, in this order:
+Three findings did the work, and two of them were surprises:
 
-    model    parameter count vs the paper's 36.7M  (CPU-only, seconds)
-    gpu      precision x batch-shape matrix        <- the headline experiment
-    kernels  torch.profiler top CUDA kernels       <- says *which* op, not just "slow"
-    stages   per-sample data-pipeline breakdown    <- the 2.7x
-    workers  DataLoader scaling, 2 points          <- confirm the sweet spot only
-    fit      real Lightning fit -> T_real          <- ties it all back to wall clock
+* Channel width, not precision. TF32 bought 1.12% and bf16 tied it exactly,
+  which is what said the model was not matmul-bound. The repo default ran the
+  MaxViT centre at 512 channels (78% of 82.6M parameters) where the paper says
+  "256 channels throughout ... 36.7 million parameters".
+* `nn.GroupNorm(num_groups=1)` held 59% of CUDA time at 5.4 ms/call. Its CUDA
+  moments kernel launches on a grid of `N * num_groups` blocks -- 4 blocks on a
+  132-SM GPU. `torch.compile` decomposes it into var_mean + elementwise and
+  fuses that away; afterwards the profile is ordinary conv/GEMM work.
+* Dask, not storage. Per-sample read cost tracked *chunks* rather than bytes
+  (satellite read 2.5x the bytes in 0.6x the time), re-running identical reads
+  changed nothing (so not filesystem latency), and `chunks=None` tied reading
+  the zarr arrays directly. ~24 ms/chunk of scheduler and graph-construction
+  overhead against ~0.6 ms of real work.
 
-RUN `--sections model,gpu` FIRST. It is a fork in the road: if GPU-only comes
-back near 4 s/step the bottleneck is compute and the data sections can wait;
-if it comes back near 0.5 s/step then compute is fine and the whole gap is in
-the data pipeline, so run everything else.
+Ruled out along the way, each by measurement: spatial resolution (already
+matched the paper), TF32, HFS read latency, zstd throughput, and staging the
+121 GB of stores onto node-local NVMe.
 
-Why the precision matrix exists: nothing in this repo calls
-`torch.set_float32_matmul_precision`, and PyTorch's default is "highest", so
-every matmul runs in true FP32 with no TensorCore path -- on Hopper the
-FP32-vs-TF32 matmul peak differs by ~7-8x, which had the right shape for this
-gap. Measuring it is what ruled it out (1.12x, see above). Keep the matrix: it
-is the cheapest way to re-check the same question after any architecture change,
-since a narrower network can shift back toward matmul-bound.
+SECTIONS, roughly in the order they are useful:
 
-Why the batch-shape comparison exists: the paper fit batch 16 on an 80GB H100.
-An H200 has 140GiB. Splitting into 4 micro-batches costs 4x the kernel launches
-and lower occupancy for nothing, if 16 fits in one go. It currently OOMs; if
-`--dims 128 256 256 128` roughly halves activation memory, retry this -- it is
-the next-largest lever after channel width.
+    model      parameter count vs the paper's 36.7M   (CPU-only, safe on a login node)
+    checknorm  var_mean norm == nn.GroupNorm(1)?      (run before trusting --norm var_mean)
+    boundary   multi-store routing returns the right frames  <- correctness, not speed
+    readpath   xarray+dask vs chunks=None vs raw zarr
+    stages     per-sample breakdown, and whether cost tracks frames or calls
+    workers    loader throughput vs worker count
+    gpu        precision x batch-shape matrix
+    kernels    torch.profiler top CUDA kernels
+    fit        real Lightning fit -> T_real
 
-Usage: see the `--sections` notes above; every section shares the same
---qpesums / --sta-h8 paths you pass to training.
+The defaults now mirror training: dims (256,)*4, `torch.compile` on, fp32.
+Pass `--no-compile` or `--dims 128 256 512 128` to reproduce an earlier row.
+
+Usage: every section shares the same --qpesums / --sta-h8 paths training takes;
+`--sta-h8` accepts the comma-separated list of quarterly stores.
 """
 
 from __future__ import annotations
@@ -85,6 +81,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import lightning as L  # noqa: E402
 
 import rainpro.data.rainpro8_dataset as dsmod  # noqa: E402
+from rainpro.data.rainpro8_dataset import _StoreHandle, split_sta_h8_paths  # noqa: E402
 from rainpro.data.rainpro8_datamodule import RainPro8DataModule  # noqa: E402
 from rainpro.data.regrid import NearestNeighborRegridder  # noqa: E402
 from rainpro.modules.rainpro8 import RainPro8Module  # noqa: E402
@@ -151,23 +148,22 @@ def build_module(dm, args):
     `set_norm_impl` must run before the module is built -- `LayerNorm` picks its
     implementation at construction, so flipping it afterwards does nothing."""
     set_norm_impl(args.norm)
-    kwargs = {}
+    kwargs = {"compile_model": args.compile}
     if args.dims is not None:
         kwargs["dims"] = tuple(args.dims)
     if args.center_depth is not None:
         kwargs["center_depth"] = args.center_depth
+    # `RainPro8Module` owns the compile now (it rebinds `self.model.forward`
+    # itself), so this goes through `compile_model=` rather than compiling again
+    # out here -- doing both would wrap an already-compiled function. The one
+    # exception is a non-default `--compile-mode`, which the module doesn't
+    # expose: build eager and wrap once here instead.
+    wants_mode = args.compile and args.compile_mode != "default"
+    if wants_mode:
+        kwargs["compile_model"] = False
     module = RainPro8Module(data=dm, max_epochs=1, **kwargs)
-
-    if args.compile:
-        # Compile the *network* forward only, and by rebinding the bound method
-        # rather than wrapping the module: `RainPro.predict` calls
-        # `self.forward(...)`, and `torch.compile(module)` returns an
-        # OptimizedModule whose `.predict` would still run eager. This also
-        # keeps `self.criterion` (Bucketize/Threshold) outside the graph, where
-        # it would most likely break it anyway.
-        module.model.forward = torch.compile(
-            module.model.forward, mode=args.compile_mode
-        )
+    if wants_mode:
+        module.model.forward = torch.compile(module.model.forward, mode=args.compile_mode)
     return module
 
 
@@ -643,6 +639,95 @@ def benchmark_stages(args):
 
 
 # --------------------------------------------------------------------------
+# boundary: does multi-store routing return the same bytes as reading direct?
+# --------------------------------------------------------------------------
+
+def benchmark_boundary(args):
+    """Verify `_StoreHandle`'s routing against the stores themselves.
+
+    STA_H8 is split across quarterly stores and is no longer `xr.concat`ed;
+    `_StoreHandle` merges the time indices and dispatches each read to the
+    owning dataset. A bug there returns *plausible* data from the wrong quarter,
+    which no loss curve would ever reveal -- so check it directly, and check it
+    hardest where the routing actually does something: timestamps either side of
+    a store boundary, read in one call.
+
+    For every consecutive pair of stores this reads a window spanning the seam
+    and compares, frame by frame, against opening each store on its own."""
+    import xarray as xr
+
+    print("\n=== Multi-store routing correctness ===")
+    paths = split_sta_h8_paths(args.sta_h8)
+    if len(paths) < 2:
+        print(f"  only {len(paths)} STA_H8 store(s); routing is the single-store "
+              "fast path, nothing to cross-check")
+        return
+
+    datasets = [xr.open_zarr(p, consolidated=False, chunks=None) for p in paths]
+    handle = _StoreHandle(datasets)
+    var = _first_time_var(handle.primary)
+    index = handle.time_index
+    print(f"  {len(paths)} stores, merged index {len(index)} times "
+          f"[{index[0]} .. {index[-1]}], variable={var}")
+
+    if not index.is_monotonic_increasing:
+        print("  FAIL merged time index is not monotonic -- "
+              "get_indexer(method='nearest') would be wrong")
+        return
+    dupes = int(index.duplicated().sum())
+    print(f"  {'ok  ' if dupes == 0 else 'WARN'} duplicate timestamps across stores: {dupes}")
+
+    # Where does ownership change? Those are the seams worth probing.
+    owner = handle._owner  # noqa: SLF001 -- this test exists to check it
+    seams = np.flatnonzero(owner[1:] != owner[:-1]) + 1
+    print(f"  ownership changes at {len(seams)} position(s): {seams.tolist()}")
+
+    ok = True
+    half = max(args.boundary_frames // 2, 1)
+    for seam in seams:
+        lo, hi = max(int(seam) - half, 0), min(int(seam) + half, len(index))
+        positions = np.arange(lo, hi)
+        got = handle.read(var, positions)
+        # Reference: resolve each position independently, straight from the
+        # dataset that owns it, with no batching and no routing shortcuts.
+        want = np.stack([
+            np.asarray(
+                datasets[int(owner[p])][var].isel(time=int(handle._local[p])).values,  # noqa: SLF001
+                dtype=np.float32,
+            )
+            for p in positions
+        ])
+        same = np.array_equal(np.nan_to_num(got, nan=-12345.0),
+                              np.nan_to_num(want, nan=-12345.0))
+        stores = sorted({int(owner[p]) for p in positions})
+        print(f"    {'ok  ' if same else 'FAIL'} seam @ {index[seam]} "
+              f"({len(positions)} frames spanning stores {stores})")
+        ok &= same
+
+    # And one ordinary interior window, so a pass at the seams isn't just a
+    # pass on a code path that never ran.
+    rng = random.Random(args.seed)
+    start = rng.randrange(0, max(len(index) - args.boundary_frames, 1))
+    positions = np.arange(start, min(start + args.boundary_frames, len(index)))
+    got = handle.read(var, positions)
+    want = np.stack([
+        np.asarray(
+            datasets[int(owner[p])][var].isel(time=int(handle._local[p])).values,  # noqa: SLF001
+            dtype=np.float32,
+        )
+        for p in positions
+    ])
+    same = np.array_equal(np.nan_to_num(got, nan=-12345.0),
+                          np.nan_to_num(want, nan=-12345.0))
+    print(f"    {'ok  ' if same else 'FAIL'} interior window @ {index[start]}")
+    ok &= same
+
+    handle.close()
+    print("  => routing verified" if ok else
+          "  => ROUTING IS WRONG; do not train on this")
+
+
+# --------------------------------------------------------------------------
 # readpath: is the per-chunk cost the store, or the layer on top of it?
 # --------------------------------------------------------------------------
 
@@ -880,6 +965,7 @@ SECTIONS = {
     "gpu": benchmark_gpu,
     "kernels": benchmark_kernels,
     "stages": benchmark_stages,
+    "boundary": benchmark_boundary,
     "readpath": benchmark_readpath,
     "workers": benchmark_workers,
     "fit": benchmark_fit,
@@ -917,10 +1003,9 @@ def main():
                     help="matches rainpro8.yml; must be >= 62 for the CPU-only split")
     ap.add_argument("--dims", type=int, nargs=4, default=None,
                     metavar=("DIM_4KM", "DIM_8KM", "DIM_16KM", "DIM_2KM"),
-                    help="override RainPro's channel widths. The repo default is "
-                         "(128, 256, 512, 128), which measures 82.6M parameters "
-                         "against the paper's 36.7M; the MaxViT centre runs at "
-                         "DIM_16KM and holds 78%% of them. Try `--dims 128 256 256 128`.")
+                    help="override RainPro's channel widths. Omit to use what training "
+                         "uses, now (256, 256, 256, 256) == the paper's 36.7M. Pass "
+                         "`--dims 128 256 512 128` to re-measure the old 82.6M default.")
     ap.add_argument("--center-depth", type=int, default=None,
                     help="number of MaxViT blocks (repo and paper both use 12)")
     ap.add_argument("--norm", default="native", choices=["native", "var_mean"],
@@ -929,12 +1014,14 @@ def main():
                          "of only N blocks (4 at micro-batch 4, on 132 SMs) and ate 59%% "
                          "of CUDA time when measured. 'var_mean' is the same function "
                          "through a multi-block reduction; run --sections checknorm first.")
-    ap.add_argument("--compile", action="store_true",
-                    help="torch.compile the network forward. Inductor decomposes "
-                         "aten.native_group_norm into var_mean + elementwise and can fuse "
-                         "the result, so this is the other route past the same kernel. "
-                         "Expect minutes of compilation on the first step; --gpu-warmup "
-                         "covers it, and set TORCH_LOGS=graph_breaks to see fragmentation.")
+    ap.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                    help="torch.compile the network forward, as training now does by "
+                         "default. Inductor decomposes aten.native_group_norm into "
+                         "var_mean + elementwise and fuses the result, which is what "
+                         "removed the GroupNorm(num_groups=1) occupancy cliff (3.4x). "
+                         "Pass --no-compile to measure eager. Expect minutes of "
+                         "compilation on the first step; --gpu-warmup covers it, and set "
+                         "TORCH_LOGS=graph_breaks to see fragmentation.")
     ap.add_argument("--compile-mode", default="default",
                     choices=["default", "reduce-overhead", "max-autotune"])
     ap.add_argument("--variants", type=int, nargs="+", default=None,
@@ -955,6 +1042,8 @@ def main():
                     help="frames per read for the QPESUMS store; 36 == target_2km's "
                          "real per-call shape")
     ap.add_argument("--readpath-repeats", type=int, default=10)
+    ap.add_argument("--boundary-frames", type=int, default=12,
+                    help="frames per window in the routing check, centred on each seam")
     ap.add_argument("--worker-sweep", type=int, nargs="+", default=[4, 11])
     ap.add_argument("--worker-batches", type=int, default=20)
     ap.add_argument("--gpu-warmup", type=int, default=5)

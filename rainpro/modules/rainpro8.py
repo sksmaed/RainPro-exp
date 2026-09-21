@@ -41,7 +41,17 @@ class RainPro8Module(L.LightningModule):
         data: RainPro8DataModule,
         max_epochs: int,
         skip_padding_4km: int = 32,
-        dims: tuple[int, int, int, int] = (128, 256, 512, 128),
+        # Paper Sec. 4: "We use 256 channels throughout the entire network,
+        # totaling 36.7 million parameters", and Sec. 3.4 describes "halving
+        # internal channels" relative to MetNet-3's 227M. `rainpro/network/
+        # rainpro8.py`'s own default `(128, 256, 512, 128)` measures 82.62M
+        # here -- 2.25x the paper, with the MaxViT centre alone holding 64.8M
+        # (78%) at 512 channels. Upstream ships no RainPro-8 training config to
+        # arbitrate (only the SEVIR one in config.yml, whose sibling network
+        # `rainpro/network/rainpro.py` takes a single scalar `dim: int = 256`),
+        # so this follows the paper: flat 256 measures ~36.7M.
+        dims: tuple[int, int, int, int] = (256, 256, 256, 256),
+        compile_model: bool = True,
         cond_dim: int = 32,
         center_depth: int = 12,
         stochastic_depth_prob: float = 0.2,
@@ -88,6 +98,30 @@ class RainPro8Module(L.LightningModule):
             ratio=lead_time_decay_ratio,
             buckets_fn=taiwan_dbz_buckets,
         )
+
+        if compile_model:
+            # Rebind the bound method rather than wrapping the module. Two
+            # reasons, both load-bearing:
+            #   * `RainPro.predict` calls `self.forward(...)`, so
+            #     `torch.compile(self.model)` -- which only compiles
+            #     `__call__` -- would leave every real call path eager.
+            #   * `torch.compile(module)` returns an `OptimizedModule` that
+            #     prefixes every parameter with `_orig_mod.`, making its
+            #     checkpoints incompatible with an uncompiled run. Rebinding
+            #     leaves `state_dict()` keys untouched, so checkpoints stay
+            #     interchangeable and `scripts/infer_visualize.py` keeps working.
+            # `self.model.criterion` (Bucketize/Threshold) stays outside the
+            # graph, where it would most likely break it anyway.
+            #
+            # Measured on 1x H200, dims=(256,)*4, batch 4 x accum 4, fp32:
+            # 2.325 -> 0.679 s/optimizer step (3.4x) and 41.7 -> 27.0 GiB peak.
+            # Most of that is one pathology: `nn.GroupNorm(num_groups=1)` (see
+            # rainpro/network/clt.py) launches its moments kernel on a grid of
+            # `N * num_groups` blocks -- 4 blocks on a 132-SM GPU -- and held
+            # 59% of all CUDA time. Inductor decomposes it into `var_mean` plus
+            # elementwise ops and fuses them; afterwards the profile is ordinary
+            # conv/GEMM work. Pass `compile_model=false` to fall back to eager.
+            self.model.forward = torch.compile(self.model.forward)
 
         self.val_metrics = create_metrics(self.T_out, "val")
         self.test_metrics = create_metrics(self.T_out, "test")
