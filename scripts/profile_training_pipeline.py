@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import os
 import random
 import statistics
@@ -88,6 +89,7 @@ from rainpro.data.rainpro8_datamodule import RainPro8DataModule  # noqa: E402
 from rainpro.data.regrid import NearestNeighborRegridder  # noqa: E402
 from rainpro.modules.rainpro8 import RainPro8Module  # noqa: E402
 from rainpro.modules.utils import EvalRequest  # noqa: E402
+from rainpro.network.clt import GroupNorm1VarMean, set_norm_impl  # noqa: E402
 
 # docs/rainpro_paper.md:626 (Table 9) and :267.
 PAPER_SECONDS_PER_STEP = 13.6 * 3600 / 100_000  # 0.4896 s @ batch 16
@@ -142,14 +144,31 @@ def setup_dm(args, num_workers=None, batch_size=None):
 
 def build_module(dm, args):
     """`--dims` exists so the paper's 36.7M can be *tested*, not argued about.
-    The default here mirrors `RainPro8Module`; pass e.g. `--dims 128 256 256 128`
-    to halve the MaxViT centre stage and re-run `model` / `gpu` against it."""
+    `(256, 256, 256, 256)` is the measured match and the paper's stated "256
+    channels throughout"; the repo default `(128, 256, 512, 128)` measures
+    82.6M.
+
+    `set_norm_impl` must run before the module is built -- `LayerNorm` picks its
+    implementation at construction, so flipping it afterwards does nothing."""
+    set_norm_impl(args.norm)
     kwargs = {}
     if args.dims is not None:
         kwargs["dims"] = tuple(args.dims)
     if args.center_depth is not None:
         kwargs["center_depth"] = args.center_depth
-    return RainPro8Module(data=dm, max_epochs=1, **kwargs)
+    module = RainPro8Module(data=dm, max_epochs=1, **kwargs)
+
+    if args.compile:
+        # Compile the *network* forward only, and by rebinding the bound method
+        # rather than wrapping the module: `RainPro.predict` calls
+        # `self.forward(...)`, and `torch.compile(module)` returns an
+        # OptimizedModule whose `.predict` would still run eager. This also
+        # keeps `self.criterion` (Bucketize/Threshold) outside the graph, where
+        # it would most likely break it anyway.
+        module.model.forward = torch.compile(
+            module.model.forward, mode=args.compile_mode
+        )
+    return module
 
 
 # --------------------------------------------------------------------------
@@ -187,6 +206,96 @@ def benchmark_model(args):
     for name, count in rows:
         print(f"  {name:30s} {count/1e6:8.3f}M  {100*count/max(total,1):5.1f}%")
     del model, dm
+
+
+# --------------------------------------------------------------------------
+# checknorm: prove the replacement is the same function before timing it
+# --------------------------------------------------------------------------
+
+def _norm_pair(num_channels, device, dtype):
+    import torch.nn as nn
+
+    native = nn.GroupNorm(1, num_channels, affine=True).to(device)
+    with torch.no_grad():
+        native.weight.normal_(1.0, 0.1)
+        native.bias.normal_(0.0, 0.1)
+    custom = GroupNorm1VarMean(num_channels, affine=True).to(device)
+    # Same parameter names and shapes, so this is also the check that a
+    # checkpoint moves between the two implementations unchanged.
+    custom.load_state_dict(native.state_dict())
+    return native, custom
+
+
+def benchmark_check_norm(args):
+    """`var_mean` is only worth timing if it is the *same* normalization.
+
+    Two things could silently differ: `torch.var_mean` defaults to the unbiased
+    `correction=1` while GroupNorm uses the population variance, and the affine
+    has to land per channel rather than per element. Both would still train --
+    just not the paper's model. So compare forward and every gradient path
+    before trusting any speed number."""
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"\n=== Norm equivalence check (device={device.type}) ===")
+    C = 256
+    ok = True
+    for dtype, label in ((torch.float32, "fp32"), (torch.bfloat16, "bf16-autocast")):
+        if dtype is torch.bfloat16 and device.type != "cuda":
+            continue
+        torch.manual_seed(args.seed)
+        native, custom = _norm_pair(C, device, dtype)
+        x = torch.randn(2, C, 64, 64, device=device)
+
+        outs, grads, out_dtypes = [], [], []
+        for mod in (native, custom):
+            xi = x.clone().requires_grad_(True)
+            mod.zero_grad(set_to_none=True)
+            ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+                   if dtype is torch.bfloat16 else contextlib.nullcontext())
+            with ctx:
+                y = mod(xi)
+            out_dtypes.append(y.dtype)
+            # A non-uniform scalar, so every element contributes distinctly --
+            # `y.sum()` would hide errors that cancel across the tensor.
+            loss = (y.float() * torch.linspace(0.5, 1.5, C, device=device)
+                    .view(1, -1, 1, 1)).square().mean()
+            loss.backward()
+            outs.append((y.float().detach(), loss.detach()))
+            grads.append((xi.grad.float(), mod.weight.grad.float(), mod.bias.grad.float()))
+
+        # Autocast keeps some normalizations in fp32 regardless of the ambient
+        # dtype. If native comes back fp32 here while the custom one comes back
+        # bf16, that is worth knowing twice over: the bf16 comparison below is
+        # then across two precisions (so expect it to sit near tolerance), and
+        # it would also explain why bf16-mixed bought ~0% speed earlier -- the
+        # kernel holding 59% of the time would have been running fp32 anyway.
+        if dtype is torch.bfloat16:
+            differ = "   <- DIFFER, see note below" if out_dtypes[0] != out_dtypes[1] else ""
+            print(f"    autocast output dtype: native={out_dtypes[0]} "
+                  f"custom={out_dtypes[1]}{differ}")
+
+        tol = 2e-3 if dtype is torch.bfloat16 else 2e-5
+        rows = [
+            ("forward", outs[0][0], outs[1][0]),
+            ("loss", outs[0][1], outs[1][1]),
+            ("grad input", grads[0][0], grads[1][0]),
+            ("grad weight", grads[0][1], grads[1][1]),
+            ("grad bias", grads[0][2], grads[1][2]),
+        ]
+        print(f"  {label} (tolerance {tol:g}):")
+        for name, a, b in rows:
+            diff = (a - b).abs().max().item()
+            scale = max(a.abs().max().item(), 1e-12)
+            rel = diff / scale
+            flag = "ok " if rel <= tol else "FAIL"
+            ok &= rel <= tol
+            print(f"    {flag} {name:12s} max|diff|={diff:.3e}  rel={rel:.3e}")
+    print("  => equivalent" if ok else
+          "  => NOT equivalent; do not trust var_mean timings until this passes")
+    print("  NOTE: if the bf16 row shows native=float32 and custom=bfloat16, autocast is\n"
+          "  keeping nn.GroupNorm in fp32. That is a real finding, not a bug in the check:\n"
+          "  it would mean bf16-mixed never touched the kernel holding 59% of CUDA time,\n"
+          "  which is exactly why bf16 measured no faster than TF32. The fp32 rows above\n"
+          "  are then the authoritative equivalence evidence.")
 
 
 # --------------------------------------------------------------------------
@@ -282,7 +391,9 @@ def benchmark_gpu(args):
     print(header)
     print("-" * len(header))
     results = {}
-    for label, matmul, amp_dtype, cudnn_bench in GPU_VARIANTS:
+    variants = ([GPU_VARIANTS[i] for i in args.variants]
+                if args.variants is not None else GPU_VARIANTS)
+    for label, matmul, amp_dtype, cudnn_bench in variants:
         torch.set_float32_matmul_precision(matmul)
         torch.backends.cudnn.benchmark = cudnn_bench
         for micro in shapes:
@@ -367,15 +478,21 @@ def benchmark_kernels(args):
     # this section reported a single 18us `cudaDeviceSynchronize` and no CUDA
     # kernels at all. Profiling a fixed number of steps with no cycling keeps
     # every event.
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=False,
-    ) as prof:
-        for _ in range(args.kernel_steps):
-            one_step()
-        torch.cuda.synchronize()
-
-    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=args.kernel_rows))
+    # Profiling compiled code can fail inside Triton's own teardown; that must
+    # not take the whole run's results with it.
+    try:
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=False,
+        ) as prof:
+            for _ in range(args.kernel_steps):
+                one_step()
+            torch.cuda.synchronize()
+        print(prof.key_averages().table(sort_by="self_cuda_time_total",
+                                        row_limit=args.kernel_rows))
+    except Exception as exc:  # noqa: BLE001 -- diagnostic script, never fatal
+        print(f"kernel profile failed ({type(exc).__name__}: {exc}); "
+              "with --compile, try running `--sections kernels` on its own")
     torch.set_float32_matmul_precision("highest")
     del model, optimizer, gpu_batch, dm
     torch.cuda.empty_cache()
@@ -481,13 +598,28 @@ def benchmark_stages(args):
 # --------------------------------------------------------------------------
 
 def benchmark_workers(args):
-    """Trimmed to two points on purpose. At ~2.1 core-s/sample you need ~8.5
-    cores to feed one GPU at 4 samples/s, and the allocation caps at 12 -- so
-    the useful question is only "does 11 beat the midpoint", not the shape of
-    a 7-point curve that costs 7 more full QPESUMS index scans to draw."""
-    print("\n=== DataLoader worker scaling ===")
+    """Does loader throughput scale with worker count, or plateau?
+
+    That is the question that separates a latency-bound pipeline (more
+    concurrent readers help) from a saturated shared filesystem (they do not,
+    and the fix is to move the bytes instead)."""
+    print("\n=== DataLoader worker scaling ===", flush=True)
+    # One datamodule for the whole sweep. `_dataloader` reads `self.num_workers`
+    # at call time, so the worker count can be varied between points -- and the
+    # split computation (a scan over QPESUMS' ~610k timestamps plus the STA_H8
+    # coverage union across every store) is identical for every point. Paying it
+    # once instead of once per point is most of this section's wall time on a
+    # busy filesystem, and it was why the section could sit silent for many
+    # minutes before the first row appeared.
+    t0 = time.perf_counter()
+    dm = setup_dm(args)
+    print(f"splits ready in {time.perf_counter() - t0:.1f}s; sweeping "
+          f"{args.worker_sweep} x ({args.loader_warmup} warmup + "
+          f"{args.worker_batches} timed) batches of {args.batch_size}", flush=True)
     for workers in args.worker_sweep:
-        dm = setup_dm(args, num_workers=workers)
+        dm.num_workers = workers
+        dm.persistent_workers = workers > 0
+        dm.prefetch_factor = args.prefetch_factor if workers > 0 else None
         loader = dm.train_dataloader()
         it = iter(loader)
         warmup = 0 if workers == 0 else min(args.loader_warmup, 10)
@@ -495,18 +627,21 @@ def benchmark_workers(args):
             next(it)
         times = []
         for _ in range(args.worker_batches):
-            t0 = time.perf_counter()
+            t = time.perf_counter()
             next(it)
-            times.append(time.perf_counter() - t0)
+            times.append(time.perf_counter() - t)
         mean = statistics.mean(times)
         print(
             f"workers={workers:2d}: mean={mean:.4f}s/batch "
-            f"p95={pct(times,95):.4f}s throughput={args.batch_size/mean:.2f} samples/s"
+            f"p95={pct(times,95):.4f}s throughput={args.batch_size/mean:.2f} samples/s",
+            flush=True,
         )
         # Drop the iterator explicitly: it owns the worker processes, and
         # relying on rebinding at the top of the next loop would keep the old
         # pool alive while the next one spawns.
-        del it, loader, dm
+        del it, loader
+        gc.collect()
+    del dm
 
 
 # --------------------------------------------------------------------------
@@ -578,12 +713,18 @@ def benchmark_fit(args):
               f"{mean*2300/3600:.2f} h/epoch at ~2300 steps/epoch")
     print(f"(total wall incl. setup/teardown: {wall:.1f}s)")
     torch.set_float32_matmul_precision("highest")
+    # `persistent_workers=True` keeps this fit's worker processes alive for as
+    # long as the DataLoader is reachable, so without this they would sit on
+    # the allocation's CPUs and page cache through every later section.
+    del trainer, model, timer, dm
+    gc.collect()
 
 
 # --------------------------------------------------------------------------
 
 SECTIONS = {
     "model": benchmark_model,
+    "checknorm": benchmark_check_norm,
     "gpu": benchmark_gpu,
     "kernels": benchmark_kernels,
     "stages": benchmark_stages,
@@ -629,6 +770,26 @@ def main():
                          "DIM_16KM and holds 78%% of them. Try `--dims 128 256 256 128`.")
     ap.add_argument("--center-depth", type=int, default=None,
                     help="number of MaxViT blocks (repo and paper both use 12)")
+    ap.add_argument("--norm", default="native", choices=["native", "var_mean"],
+                    help="NCHW normalization implementation. 'native' is upstream's "
+                         "nn.GroupNorm(num_groups=1), whose moments kernel gets a grid "
+                         "of only N blocks (4 at micro-batch 4, on 132 SMs) and ate 59%% "
+                         "of CUDA time when measured. 'var_mean' is the same function "
+                         "through a multi-block reduction; run --sections checknorm first.")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the network forward. Inductor decomposes "
+                         "aten.native_group_norm into var_mean + elementwise and can fuse "
+                         "the result, so this is the other route past the same kernel. "
+                         "Expect minutes of compilation on the first step; --gpu-warmup "
+                         "covers it, and set TORCH_LOGS=graph_breaks to see fragmentation.")
+    ap.add_argument("--compile-mode", default="default",
+                    choices=["default", "reduce-overhead", "max-autotune"])
+    ap.add_argument("--variants", type=int, nargs="+", default=None,
+                    metavar="I",
+                    help="indices into the precision matrix, to skip rows you do not need: "
+                         + "; ".join(f"{i}={v[0]}" for i, v in enumerate(GPU_VARIANTS))
+                         + ". Worth using with --compile, where each row is a separate "
+                           "recompilation.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--sections", default="model,gpu",
                     help="comma-separated: " + ",".join(SECTIONS) +
@@ -657,9 +818,29 @@ def main():
     if unknown:
         raise SystemExit(f"unknown section(s) {unknown}; available: {sorted(SECTIONS)}")
 
+    # Fail in a second with a readable message, not forty lines into zarr.
+    # `salloc` hands you a fresh shell, so an exported $QPESUMS/$STA_H8 from an
+    # earlier allocation is gone and `--qpesums "$QPESUMS"` silently passes an
+    # empty string -- which zarr resolves as a relative path and reports as a
+    # missing group in the current working directory.
+    if any(s != "checknorm" for s in requested):
+        missing = []
+        for flag, value in (("--qpesums", args.qpesums), ("--sta-h8", args.sta_h8)):
+            for path in (p.strip() for p in value.split(",")):
+                if not path:
+                    missing.append(f"{flag}: empty (is the shell variable exported?)")
+                elif not os.path.exists(path):
+                    missing.append(f"{flag}: {path} does not exist")
+        if missing:
+            raise SystemExit("cannot start:\n  " + "\n  ".join(missing))
+
     print("RainPro-8-TW training-pipeline profiler")
     print(f"effective_batch={args.effective_batch} micro_batches={args.micro_batches} "
           f"workers={args.num_workers} frame_cache={args.frame_cache_size}")
+    print(f"dims={args.dims} norm={args.norm} compile={args.compile}"
+          + (f" (mode={args.compile_mode})" if args.compile else ""))
+    if args.compile and args.gpu_warmup < 3:
+        print("WARNING: --gpu-warmup < 3 with --compile; the first step pays compilation")
     print(f"paper baseline: {PAPER_SECONDS_PER_STEP:.3f} s/optimizer step "
           f"@ batch {PAPER_BATCH}, 1x H100 80GB + {PAPER_VCPUS} vCPUs "
           "(docs/rainpro_paper.md:267,626)")
