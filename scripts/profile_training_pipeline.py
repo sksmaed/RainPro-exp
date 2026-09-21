@@ -522,7 +522,32 @@ def stage_instrumentation():
 
         setattr(obj, name, wrapped)
 
-    patch(dsmod.RainPro8Dataset, "_load_frames", "load_frames_io_decode_cache")
+    # `_load_frames` gets its own wrapper so the cost can be attributed per
+    # variable *and* per frame. The 12 calls a sample makes differ by 36x in
+    # how many frames they fetch (`target_2km` asks for 36 offsets in one
+    # `isel`, `radar_8km` for 1), so whether the time tracks frames or tracks
+    # calls is what separates "reading/decompressing bytes" from "per-call
+    # xarray/dask overhead" -- and those have completely different fixes.
+    load_detail: dict[str, list[float]] = defaultdict(lambda: [0.0, 0, 0])
+    _orig_load = dsmod.RainPro8Dataset._load_frames
+    originals.append((dsmod.RainPro8Dataset, "_load_frames", _orig_load))
+
+    def _wrapped_load(self, store_key, ds, raw_name, positions, *a, **kw):
+        n_frames = 1 if positions is None else len(positions)
+        start = time.perf_counter()
+        try:
+            return _orig_load(self, store_key, ds, raw_name, positions, *a, **kw)
+        finally:
+            elapsed = time.perf_counter() - start
+            totals["load_frames_io_decode_cache"] += elapsed
+            counts["load_frames_io_decode_cache"] += 1
+            entry = load_detail[raw_name]
+            entry[0] += elapsed
+            entry[1] += 1
+            entry[2] += n_frames
+
+    dsmod.RainPro8Dataset._load_frames = _wrapped_load
+
     patch(NearestNeighborRegridder, "prepare", "regrid_prepare_kdtree")
     patch(NearestNeighborRegridder, "apply", "regrid_apply_gather")
     patch(dsmod, "_fill_no_echo", "fill_no_echo")
@@ -530,7 +555,7 @@ def stage_instrumentation():
     patch(dsmod, "minmax_normalize", "normalize")
 
     try:
-        yield totals, counts
+        yield totals, counts, load_detail
     finally:
         for obj, name, orig in reversed(originals):
             setattr(obj, name, orig)
@@ -550,7 +575,7 @@ def benchmark_stages(args):
     # persistent worker pays only once; timing it would slander the steady state.
     dataset[indices[0]]
 
-    with stage_instrumentation() as (totals, counts):
+    with stage_instrumentation() as (totals, counts, load_detail):
         per_sample = []
         for idx in indices:
             if args.clear_frame_cache:
@@ -574,6 +599,30 @@ def benchmark_stages(args):
     print(f"  {'(unaccounted: alloc/xarray/stack)':30s} total={total_wall-accounted:8.3f}s "
           f"per-sample={(total_wall-accounted)/n:7.4f}s {100*(total_wall-accounted)/total_wall:5.1f}%")
 
+    # The decisive table. Each row is one `_load_frames` call site (one variable
+    # of one source). If s/call is roughly flat across rows while frames/call
+    # ranges over 36x, the cost is per-call overhead -- xarray indexing and dask
+    # graph construction -- and the fix is to read the zarr arrays directly or
+    # to batch the calls. If instead s/frame is flat, the cost really is bytes,
+    # and the fix is chunking and the compression level.
+    if load_detail:
+        print("\n  _load_frames by variable (does cost track FRAMES or CALLS?):")
+        print(f"    {'variable':<18}{'s total':>9}{'calls':>7}{'frames':>8}"
+              f"{'s/call':>10}{'s/frame':>10}")
+        for name, (secs, calls, frames) in sorted(
+            load_detail.items(), key=lambda kv: -kv[1][0]
+        ):
+            print(f"    {name:<18}{secs:>9.3f}{calls:>7d}{frames:>8d}"
+                  f"{secs/max(calls,1):>10.4f}{secs/max(frames,1):>10.4f}")
+        per_call = [s / max(c, 1) for s, c, _ in load_detail.values()]
+        per_frame = [s / max(f, 1) for s, _, f in load_detail.values()]
+
+        def spread(xs):
+            return max(xs) / max(min(xs), 1e-12)
+
+        print(f"    spread across variables: s/call {spread(per_call):.1f}x, "
+              f"s/frame {spread(per_frame):.1f}x  <- the flatter one is the real unit")
+
     # Repeating one index serves all 62 frames from `_frame_cache`, so it is a
     # de-facto CPU-only measurement: random - same == I/O + decompress. This
     # only holds while frame_cache_size >= 62 (one obs-only sample's frames).
@@ -591,6 +640,109 @@ def benchmark_stages(args):
     print(f"  => CPU-only ~{same_mean:.3f} s/sample, "
           f"I/O+decompress ~{total_wall/n - same_mean:.3f} s/sample")
     del dm
+
+
+# --------------------------------------------------------------------------
+# readpath: is the per-chunk cost the store, or the layer on top of it?
+# --------------------------------------------------------------------------
+
+def _first_time_var(ds):
+    for name, da in ds.data_vars.items():
+        if "time" in da.dims:
+            return name
+    raise SystemExit(f"no time-dimensioned data_var in {list(ds.data_vars)}")
+
+
+def benchmark_readpath(args):
+    """`stages` showed the cost tracks *chunks*, not bytes and not calls.
+
+    A chunk is one frame here, and the measured 27-40 ms per chunk is far too
+    slow for reading and decompressing ~1-6 MiB that the page cache already
+    holds (re-running `stages` on identical indices changed nothing). That
+    points above the store rather than at it: `_get_store` calls
+    `xr.open_zarr(path, consolidated=True)` with no `chunks=`, and xarray
+    defaults to `chunks='auto'`, so every `.isel(time=[...]).values` builds and
+    runs a dask graph with a task per chunk.
+
+    This compares that path against two that skip dask, on the same stores and
+    the same positions, so the fix is measured rather than assumed."""
+    import xarray as xr
+    import zarr
+
+    print("\n=== Read path comparison ===")
+    stores = [("qpesums", args.qpesums, args.readpath_frames)]
+    sta = [p.strip() for p in args.sta_h8.split(",") if p.strip()]
+    if sta:
+        # Satellite asks for 2 offsets x 9 bands per sample, so 2 is the real
+        # per-call shape there; QPESUMS' target_2km asks for 36 at once.
+        stores.append(("sta_h8[0]", sta[0], 2))
+
+    rng = random.Random(args.seed)
+    for label, path, n_frames in stores:
+        try:
+            probe = xr.open_zarr(path, consolidated=True)
+        except Exception:
+            probe = xr.open_zarr(path, consolidated=False)
+        var = _first_time_var(probe)
+        n_times = probe.sizes["time"]
+        probe.close()
+        print(f"\n  {label}: {path}")
+        print(f"  variable={var} times={n_times} frames/read={n_frames}")
+
+        # Drawn fresh per repeat, contiguous like the real offset windows.
+        position_sets = [
+            sorted(rng.sample(range(n_times), n_frames)) if n_frames > 1
+            else [rng.randrange(n_times)]
+            for _ in range(args.readpath_repeats)
+        ]
+
+        def run(make_reader, name):
+            try:
+                reader, closer = make_reader()
+            except Exception as exc:  # noqa: BLE001
+                print(f"    {name:<34} unavailable ({type(exc).__name__}: {exc})")
+                return
+            try:
+                reader(position_sets[0])  # warm up open/metadata, not timed
+                times = []
+                for pos in position_sets:
+                    t = time.perf_counter()
+                    out = reader(pos)
+                    times.append(time.perf_counter() - t)
+                    del out
+                mean = statistics.mean(times)
+                print(f"    {name:<34}{mean:>9.4f}s{mean/n_frames:>11.4f}s/frame")
+                return mean
+            finally:
+                closer()
+
+        print(f"    {'method':<34}{'s/read':>10}{'per frame':>12}")
+
+        def xr_dask():
+            ds = xr.open_zarr(path, consolidated=True)
+            return (lambda pos: ds[var].isel(time=pos).values), ds.close
+
+        def xr_nodask():
+            ds = xr.open_zarr(path, consolidated=True, chunks=None)
+            return (lambda pos: ds[var].isel(time=pos).values), ds.close
+
+        def zarr_oindex():
+            arr = zarr.open(path, mode="r")[var]
+            return (lambda pos: arr.oindex[pos]), (lambda: None)
+
+        def zarr_loop():
+            arr = zarr.open(path, mode="r")[var]
+            return (lambda pos: np.stack([arr[p] for p in pos])), (lambda: None)
+
+        base = run(xr_dask, "xarray + dask (current)")
+        for maker, name in (
+            (xr_nodask, "xarray, chunks=None (no dask)"),
+            (zarr_oindex, "zarr direct, oindex"),
+            (zarr_loop, "zarr direct, per-frame loop"),
+        ):
+            got = run(maker, name)
+            if base and got:
+                print(f"    {'':<34}{base/got:>9.1f}x faster than current")
 
 
 # --------------------------------------------------------------------------
@@ -728,6 +880,7 @@ SECTIONS = {
     "gpu": benchmark_gpu,
     "kernels": benchmark_kernels,
     "stages": benchmark_stages,
+    "readpath": benchmark_readpath,
     "workers": benchmark_workers,
     "fit": benchmark_fit,
 }
@@ -798,6 +951,10 @@ def main():
     ap.add_argument("--stage-samples", type=int, default=30,
                     help="30, not 10: per-sample variance was +-20%% in earlier runs")
     ap.add_argument("--clear-frame-cache", action="store_true")
+    ap.add_argument("--readpath-frames", type=int, default=36,
+                    help="frames per read for the QPESUMS store; 36 == target_2km's "
+                         "real per-call shape")
+    ap.add_argument("--readpath-repeats", type=int, default=10)
     ap.add_argument("--worker-sweep", type=int, nargs="+", default=[4, 11])
     ap.add_argument("--worker-batches", type=int, default=20)
     ap.add_argument("--gpu-warmup", type=int, default=5)
