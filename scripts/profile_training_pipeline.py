@@ -617,7 +617,13 @@ def benchmark_stages(args):
             return max(xs) / max(min(xs), 1e-12)
 
         print(f"    spread across variables: s/call {spread(per_call):.1f}x, "
-              f"s/frame {spread(per_frame):.1f}x  <- the flatter one is the real unit")
+              f"s/frame {spread(per_frame):.1f}x")
+        print("    Read s/frame against each source's frame SIZE, not just against the other\n"
+              "    spread -- these frames differ ~6x in bytes (QPESUMS 561x441 vs cropped\n"
+              "    STA_H8 1167x1274). A flat s/frame across that means a fixed per-chunk\n"
+              "    cost (dask's ~24 ms was found this way); an s/frame that rises with size\n"
+              "    means the work really is bytes, i.e. decompression, and there is little\n"
+              "    overhead left to remove.")
 
     # Repeating one index serves all 62 frames from `_frame_cache`, so it is a
     # de-facto CPU-only measurement: random - same == I/O + decompress. This
