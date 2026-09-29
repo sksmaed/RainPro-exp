@@ -43,8 +43,14 @@ so the exceedance curve is `S_k = 1 - probs = P(Y > t_k)` over the 16
     the open-ended top bin can't inflate peaks beyond what the model can
     actually resolve.
 
-Also prints a per-lead-time CSI table (0.5 forecast vs. persistence, against
-GT) for this single case -- anecdotal, not a substitute for test-set scores.
+Also prints two per-lead-time tables for this single case -- anecdotal, not a
+substitute for validation-set scores (scripts/eval_persistence.py):
+  * CSI, 0.5 forecast vs. persistence, against GT.
+  * Probability mass vs. event area, `--mass-thresholds`: sum over pixels of
+    P(Y > t) x 4 km^2 against the GT area >= t (both over GT-valid pixels).
+    Mass close to the GT area but a diffuse P map -> the model knows how much
+    strong echo there is, just not where. Mass far below it -> it genuinely
+    predicts too little strong echo.
 
 Usage:
     python scripts/infer_visualize.py \\
@@ -115,7 +121,11 @@ def load_module(ckpt_path: str, datamodule: RainPro8DataModule, device: str) -> 
     # `data` is excluded from the checkpoint's hparams (`save_hyperparameters(
     # ignore="data")`), so it has to be supplied here; everything else
     # (max_epochs, dims, dropout, ...) comes back from the checkpoint.
-    module = RainPro8Module.load_from_checkpoint(ckpt_path, data=datamodule, map_location=device)
+    # compile_model=False: one forward pass never repays torch.compile's
+    # compile time (and CPU compile needs a working C++ toolchain).
+    module = RainPro8Module.load_from_checkpoint(
+        ckpt_path, data=datamodule, map_location=device, compile_model=False
+    )
     return module.eval().to(device)
 
 
@@ -192,6 +202,8 @@ def main() -> None:
     ap.add_argument("--prob-thresholds", default="20,34",
                      help="comma-separated dBZ for the P(>t) columns; must be bucket boundaries "
                           f"{BUCKET_EDGES}")
+    ap.add_argument("--mass-thresholds", default="20,34,40",
+                     help="comma-separated dBZ (bucket boundaries) for the probability-mass table")
     ap.add_argument("--out", default="inference.png",
                      help="output path stem; one file per checkpoint, <stem>_<ckpt name>.png")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -237,6 +249,10 @@ def main() -> None:
         raise SystemExit(f"--prob-thresholds {bad} are not bucket boundaries {BUCKET_EDGES}")
     # probs[:, :, k] is the CDF at BUCKET_EDGES[k], so 1 - probs is P(Y > edge)
     prob_idx = [BUCKET_EDGES.index(t) for t in prob_thresholds]
+    mass_thresholds = [float(x) for x in args.mass_thresholds.split(",")]
+    bad = [t for t in mass_thresholds if t not in BUCKET_EDGES]
+    if bad:
+        raise SystemExit(f"--mass-thresholds {bad} are not bucket boundaries {BUCKET_EDGES}")
 
     dataset = RainPro8Dataset(
         data_root=data_root,
@@ -299,6 +315,23 @@ def main() -> None:
                 .rjust(len(f"CSI{t:g} fcst/pers"))
                 for t in prob_thresholds
             ]
+            print(f"  +{lt:<4}   " + "  ".join(cells))
+
+        # Probability mass vs. event area, over GT-valid pixels only. The
+        # target is 2 km, so each pixel is 4 km^2. Compared against GT >= t
+        # because that is the event channel t was trained on: the loss's
+        # `Bucketize(right=True)` encodes a target of exactly t as exceeding t.
+        px_km2 = target_spec.resolution_km**2
+        valid = np.isfinite(truth)  # (n_lead, H, W)
+        print("  lead    " + "  ".join(f"sumP>{t:g} / GT>={t:g} km2".rjust(24) for t in mass_thresholds))
+        for row, lt in enumerate(lead_times):
+            cells = []
+            for t in mass_thresholds:
+                k = BUCKET_EDGES.index(t)
+                mass = float(exceed[row, k][valid[row]].sum() * px_km2)
+                area = float((truth[row][valid[row]] >= t).sum() * px_km2)
+                ratio = f"({mass / area:.2f}x)" if area else "(  -  )"
+                cells.append(f"{mass:7.0f} / {area:7.0f} {ratio:>8}".rjust(24))
             print(f"  +{lt:<4}   " + "  ".join(cells))
 
 

@@ -114,3 +114,75 @@ class NearestNeighborRegridder:
         arrays onto the SAME (dst_lat, dst_lon) (e.g. multiple timesteps of
         one sample's one source, see RainPro8Dataset.__getitem__)."""
         return self.apply(src_data, self.prepare(dst_lat, dst_lon), fill_value)
+
+
+@dataclass(frozen=True)
+class AggregationMapping:
+    """Which destination cell each source pixel falls in, for area
+    aggregation (`aggregate`) instead of nearest-neighbor point sampling.
+
+    Nearest-neighbor keeps ONE source pixel per destination cell: on QPESUMS
+    (~1.3 km) that is ~1 of 9 pixels at 4 km and ~1 of 36 at 8 km, so small
+    convective cores are mostly never seen. Here every source pixel is
+    assigned to exactly the one cell whose footprint contains it -- a
+    partition, nothing dropped or double-counted -- and cells are reduced over
+    all of their pixels."""
+
+    cell: np.ndarray  # flat destination cell index per *kept* source pixel
+    keep: np.ndarray  # flat bool over the source grid: pixel lies inside the canvas
+    dst_shape: tuple[int, int]
+
+
+def prepare_aggregation(
+    src_lat: np.ndarray,
+    src_lon: np.ndarray,
+    center_lat: float,
+    center_lon: float,
+    size_km: float,
+    resolution_km: float,
+) -> AggregationMapping:
+    """Cells are the footprints of `target_grid(center_lat, center_lon,
+    size_km, resolution_km)`'s pixel centres (same local equirectangular
+    approximation), so aggregated and nearest-neighbor outputs of the same
+    spec line up pixel for pixel. Cell index is plain arithmetic on the
+    regular destination grid -- no tree query needed."""
+    n = round(size_km / resolution_km)
+    km_per_deg_lon = KM_PER_DEG_LAT * np.cos(np.deg2rad(center_lat))
+    # Cell i spans offsets [(i - n/2) * res, (i - n/2 + 1) * res) km, which puts
+    # its centre at target_grid's (i - (n-1)/2) * res.
+    row = np.floor((src_lat - center_lat) * KM_PER_DEG_LAT / resolution_km + n / 2).ravel()
+    col = np.floor((src_lon - center_lon) * km_per_deg_lon / resolution_km + n / 2).ravel()
+    keep = (row >= 0) & (row < n) & (col >= 0) & (col < n)
+    cell = (row[keep] * n + col[keep]).astype(np.int64)
+    return AggregationMapping(cell=cell, keep=keep, dst_shape=(n, n))
+
+
+def aggregate(src_data: np.ndarray, mapping: AggregationMapping, how: str) -> np.ndarray:
+    """Reduce a (*src_shape) dBZ field onto `mapping`'s cells. NaN source
+    pixels are ignored; a cell with no finite source pixel is NaN.
+
+      * "zmean": mean in linear reflectivity Z = 10**(dBZ/10), back to dBZ.
+        Averaging dBZ directly would average logarithms, i.e. a geometric mean
+        of Z that under-weights strong echo.
+      * "max": the strongest pixel in the cell (keeps convective core peaks,
+        which "zmean" dilutes by the core's share of the cell area).
+    """
+    values = src_data.ravel()[mapping.keep]
+    finite = np.isfinite(values)
+    cell = mapping.cell[finite]
+    values = values[finite]
+    n_cells = mapping.dst_shape[0] * mapping.dst_shape[1]
+    count = np.bincount(cell, minlength=n_cells)
+
+    if how == "zmean":
+        z_sum = np.bincount(cell, weights=10.0 ** (values / 10.0), minlength=n_cells)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out = 10.0 * np.log10(z_sum / count)
+    elif how == "max":
+        out = np.full(n_cells, -np.inf)
+        np.maximum.at(out, cell, values)
+    else:
+        raise ValueError(f"how must be 'zmean' or 'max', got {how!r}")
+
+    out[count == 0] = np.nan
+    return out.reshape(mapping.dst_shape).astype(np.float32)
