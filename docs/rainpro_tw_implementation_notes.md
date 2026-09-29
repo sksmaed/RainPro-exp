@@ -141,3 +141,130 @@ QPESUMS 用哨兵值表示缺測而引爆。
   （約 1.6% 的畫面），修正後涵蓋整個 canvas，數字的意義完全不同
 - 輸入端（`radar_4km` / `radar_8km`）幾乎不受影響：-99 原本走 NaN → `fill_value=0.0`，
   修正後走 0 dBZ → `minmax_normalize` 後為 0.0154（`DBZ_RANGE = (-1, 64)`），差異可忽略
+
+## 訓練吞吐相關的實作決策
+
+本節的每個決定都有對應的量測，重現方式見 `scripts/profile_training_pipeline.py`（各段以
+`--sections` 指定）。參考點是論文 Table 9 的 **0.490 秒 / optimizer step**（100k steps、
+batch 16、單張 H100 SXM5 80GB + 26 vCPU，`docs/rainpro_paper.md:267` 與 `:626`）。本專案在單張
+H200 上以 batch 4 × accumulate 4 量到 **T_real = 0.747 秒 / step**，其中 GPU-only 為 0.679 秒。
+
+### 網路寬度：`dims = (256, 256, 256, 256)`
+
+論文 Sec. 4 明寫「We use 256 channels throughout the entire network, totaling 36.7 million
+parameters」，Sec. 3.4 則描述相對 MetNet-3 的 227M 做了「halving internal channels」。
+`rainpro/network/rainpro8.py` 的 `dims` 是 `(dim_4km, dim_8km, dim_16km, dim_2km)`，其中
+`dim_16km` 同時是 MaxViT centre 的寬度（`MaxVitBlocks(in_channels=dim_16km, ...)`）。
+
+實測各組態的參數量（`--sections model`）：`(128, 256, 512, 128)` 為 **82.62M**，其中 MaxViT
+一個模組就佔 64.811M（**78.4%**）；平坦的 `(256, 256, 256, 256)` 為 **≈36.7M**，與論文一致。
+上游沒有附 RainPro-8 的訓練設定檔可以仲裁（repo 內唯一的 `config.yml` 是 SEVIR 的，而其姊妹網路
+`rainpro/network/rainpro.py` 採用單一純量 `dim: int = 256`），因此以論文敘述為準。
+
+MaxViT 的 FLOPs 與參數量大致隨 `dim_16km²` 成長，所以這同時是精度與算力的決定，不只是尺寸對齊。
+
+### `torch.compile`：rebind `RainPro.forward`
+
+`RainPro8Module.__init__` 的 `compile_model`（預設 `True`）做的是：
+
+```python
+self.model.forward = torch.compile(self.model.forward)
+```
+
+**刻意不用 `torch.compile(self.model)`**，兩個理由都是必要條件：
+
+1. `RainPro.predict()` 內部呼叫的是 `self.forward(...)`。`torch.compile(module)` 只會編譯
+   `__call__`，`predict` 這條實際被走的路徑仍然是 eager。rebind 綁定方法則讓 `self.forward`
+   直接解析到編譯後的函式。
+2. `torch.compile(module)` 回傳 `OptimizedModule`，會把所有參數名加上 `_orig_mod.` 前綴，
+   checkpoint 因而與未編譯的 run 不相容。rebind 不更動 `state_dict()` 的 key，所以
+   `compile_model` 開或關的 checkpoint 可以互換，`scripts/infer_visualize.py` 也不需配合修改。
+
+`self.model.criterion`（`Bucketize` / `Threshold`）留在圖外。
+
+量測（H200、`dims=(256,)*4`、batch 4 × accum 4、fp32）：關閉為 2.325 秒/step、峰值 41.7 GiB，
+開啟為 **0.679 秒/step、27.0 GiB**（3.4×）。
+
+收益幾乎全部來自一個病灶：`rainpro/network/clt.py` 的 `LayerNorm`（非 attention 分支）使用
+`nn.GroupNorm(num_groups=1)`，而 PyTorch 的 CUDA 實作把 moments kernel 的 grid 開成
+`N × num_groups` 個 block —— micro-batch 4 時只有 **4 個 block 跑在 132 個 SM 上**。該 kernel
+單次 5.4 ms、佔全部 CUDA 時間的 **59%**（`--sections kernels`）。Inductor 會把
+`aten.native_group_norm` 分解成 `var_mean` 加 elementwise 再融合，該 kernel 隨之從 profile 中
+消失，榜首回到正常的 `convolution_backward` 與 `aten::mm`。
+
+因為瓶頸是佔用率而非算力，精度旗標在此之前幾乎無效（TF32 僅 1.12×，bf16 與 TF32 打平）；
+`rainpro/network/clt.py` 另外保留一個等價的 `GroupNorm1VarMean`（以 `set_norm_impl("var_mean")`
+切換，`--sections checknorm` 驗證 forward 與三條 gradient path 的一致性），作為 `torch.compile`
+不可用時的備案，預設不啟用。
+
+### zarr 開啟方式：`chunks=None`
+
+`rainpro/data/rainpro8_dataset.py::_open_store` 統一以 `xr.open_zarr(..., chunks=None)` 開啟所有
+store，亦即走 xarray 自己的 lazy indexing 而非 dask。
+
+訓練的讀取樣態是「每個 sample 62 個 frame、每個 frame 一個 chunk、明確索引、同步取用」，這正是
+dask 最不擅長的形狀。實測讀取 36 個 QPESUMS frame（`--sections readpath`）：
+
+| 方式 | 秒 / 次 |
+|---|---|
+| xarray + dask | 0.5685 |
+| xarray、`chunks=None` | **0.0224**（25.4×） |
+| 直接索引 zarr array | 0.0229 |
+
+`chunks=None` 與「完全繞過 xarray 直接讀 zarr」打平，這一點是判定差異來自 dask 而非儲存層的關鍵
+證據。另外兩項證據：以相同索引重跑一次讀取（page cache 命中）時間不變，排除檔案系統延遲；成本隨
+**chunk 數**而非位元組量變化（衛星讀取 2.5 倍的位元組卻只花 0.6 倍時間），排除解壓縮。換算下來
+dask 在每個 chunk 上收取約 24 ms 的 scheduler 與 graph 建構開銷，而實際讀取加解壓約 0.6 ms。
+
+dask 另有一個在 SLURM 上特別傷的性質：它的 thread pool 大小取自 `os.cpu_count()`，回報的是整台
+節點而非 cgroup 配額，因此 `num_workers=11` 會產生約 1000 條執行緒搶 12 個核心。這是真實訓練中
+p95 達 9.4 秒的停頓來源；移除 dask 後 p95 降至 **0.843 秒**（改善幅度大於平均值的改善，與此機制
+一致）。
+
+移除 dask 後，`_load_frames` 的成本已隨 frame 大小等比成長（QPESUMS 409 MiB/s、STA_H8
+667 MiB/s），代表剩下的是真正的 zstd 解壓，沒有可再榨的額外開銷。
+
+### STA_H8 多 store：時間路由，不做 concat
+
+`scripts/compress_sta_h8_taiwan.py --freq quarter` 會把一年切成數個 store（`/home` 與 `/work`
+各有 100 GB 配額，單一 store 放不下）。`data_root["sta_h8"]` 因此接受逗號分隔的多個路徑。
+
+`_StoreHandle` 不把這些 store 串接起來，而是只合併**時間索引**，並記錄每個全域位置由哪個
+dataset 擁有（`_owner`）、在該 dataset 內的索引是多少（`_local`）。讀取時依 owner 分組，每個
+dataset 發一次 `isel`，因而保留 `_load_frames` 一次解析所有 offset 的批次讀取性質。36 個 offset
+只橫跨 6 小時，通常落在同一季度內；跨越接縫時單純變成兩次讀取。
+
+**不能用 `xr.concat`**：它只有在陣列是 dask-backed 時才是 lazy 的。搭配 `chunks=None` 時它會呼叫
+`np.concatenate`，在第一次 `_get_store` 就把全部約 121 GB 拉進記憶體。
+
+合併索引以 stable sort 排序，確保 `get_indexer(..., method="nearest")` 所要求的單調性成立，
+與路徑列出的順序無關。
+
+路由錯誤會回傳來自錯誤季度、但外觀完全合理的資料，在 loss 曲線上看不出來，因此
+`--sections boundary` 專門檢查這件事：找出所有 ownership 變換點，在每個接縫上讀一個跨界窗口，
+與「逐一從擁有它的 store 單獨讀」的結果逐 frame 比對，另加一個內部窗口確保該路徑確實被執行。
+
+### `eval_batch_size` 繼承 `batch_size`
+
+`rainpro8.yml` 刻意不設定 `data.eval_batch_size`，讓 `RainPro8DataModule` 回退到 `batch_size`。
+
+網路經過 `torch.compile` 之後，不同的 eval batch 等同不同的輸入形狀，Inductor 會在每次進入
+validation 時重新編譯整張圖；`check_val_every_n_epoch: 1` 代表每個 epoch 各付一次數分鐘的代價。
+留空可確保即使只在 CLI 覆寫 `--data.batch_size`，兩者仍然一致。
+
+### precision 維持 `'32'`
+
+與論文一致，而且在目前的配置下切換到 bf16 沒有 end-to-end 收益：bf16 會把 GPU-only 降到
+0.446 秒/step，相當於需要 35.9 samples/s 的資料供應，而 11 個 worker 實測供應
+19.07 samples/s（`--sections workers`）。資料端封頂時，GPU 端更快並不會反映到 wall clock。
+等資料端再快一輪之後才值得重新評估。
+
+### 已量測但刻意延後的項目
+
+| 項目 | 量測 | 延後的理由 |
+|---|---|---|
+| QPESUMS 改用解析式 regrid | `regrid_prepare_kdtree` 佔每 sample 0.117 秒（25.8%），其中 4 次呼叫有 3 次是 QPESUMS | QPESUMS 是 0.0125° 規則網格，最近鄰可純算術求得，不需 `cKDTree`；預期 T_real 0.747 → 約 0.68 秒，115k steps 僅省約 2 小時 |
+| `channels_last` | 編譯後的 profile 中 `nchwToNhwc` 與 `nhwcToNchw` 合計 5.96% | 需確認所用 PyTorch 版本的 GroupNorm 是否有 NHWC CUDA 路徑，否則只是多一次 layout 轉換 |
+| micro-batch 16 | `dims=(256,)*4` 未編譯時於 140 GiB 上 OOM | 編譯後峰值降至 27.0 GiB，已有空間重測，但資料端封頂時增益有限 |
+
+訓練期間再處理，不阻擋第一輪正式訓練。
