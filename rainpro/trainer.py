@@ -25,6 +25,9 @@ class RainProTrainer(pl.Trainer):
         callbacks: list[pl.Callback] | pl.Callback | None = None,
         auto_requeue: bool = False,
         checkpoint_interval_minutes: float | None = 30,
+        checkpoint_monitors: dict[str, Literal["min", "max"]] | None = None,
+        early_stopping_monitor: str = "val/loss",
+        early_stopping_mode: Literal["min", "max"] = "min",
         **kwargs,
     ):
         _logger = WandbLogger(name=run_name, project=project)
@@ -35,6 +38,9 @@ class RainProTrainer(pl.Trainer):
             num_animations,
             animation_bounds,
             checkpoint_interval_minutes,
+            checkpoint_monitors,
+            early_stopping_monitor,
+            early_stopping_mode,
         )
 
         # When launched under `srun` inside an sbatch script, Lightning

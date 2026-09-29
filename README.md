@@ -48,8 +48,10 @@ python main_rainpro8.py fit <run_name> --config rainpro8.yml
 To evaluate:
 
 ```
-python main_rainpro8.py test --config runs/<run_name>/config.yml <run_name> --ckpt_path runs/<run_name>/checkpoints/best.ckpt [--thresholds]
+python main_rainpro8.py test --config runs/<run_name>/config.yml <run_name> --ckpt_path runs/<run_name>/checkpoints/best_crps.ckpt [--thresholds]
 ```
+
+`best_crps.ckpt` is the pre-registered model-selection checkpoint; `best_loss.ckpt` / `best_csi.ckpt` are also saved for analysis (`trainer.checkpoint_monitors` in `rainpro8.yml`).
 
 Implementation notes / what still needs project-specific calibration before real training:
 

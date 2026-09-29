@@ -50,14 +50,19 @@ class CriticalSuccessIndex(torchmetrics.Metric):
 
         preds_bin = preds.unsqueeze(0) >= thresholds_tensor
         target_bin = target.unsqueeze(0) >= thresholds_tensor
+        # NaN target (e.g. QPESUMS out-of-coverage): `NaN >= x` is False, which
+        # would count the pixel as "observed no event" and any forecast echo
+        # there as a false alarm. Exclude it instead, same as ContingencyMetrics.
+        valid = (~torch.isnan(target)).unsqueeze(0)
 
         # Reshape to [threshold, B, T, pixels]
         preds_bin = rearrange(preds_bin, "th b t c h w -> th b t (c h w)")
         target_bin = rearrange(target_bin, "th b t c h w -> th b t (c h w)")
+        valid = rearrange(valid, "th b t c h w -> th b t (c h w)")
 
         # Compute metrics as [th, B, T]
-        hits = (preds_bin & target_bin).sum(dim=-1)
-        false_guesses = (preds_bin ^ target_bin).sum(-1)  # XOR
+        hits = (preds_bin & target_bin & valid).sum(dim=-1)
+        false_guesses = ((preds_bin ^ target_bin) & valid).sum(-1)  # XOR
 
         # Update metrics as [th, T]
         self.hits += hits.sum(dim=1)

@@ -40,6 +40,17 @@ trainer:
   project: rainpro8_tw
   devices: [0]
   num_animations: 20
+  # Model selection, fixed before looking at test results: best_crps.ckpt is
+  # THE checkpoint to evaluate (CRPS scores the whole ordinal CDF and masks
+  # NaN targets). best_loss / best_csi are kept for analysis only -- val/loss
+  # carries the 10:1 lead-time weighting and can rise while every skill score
+  # still improves; val/csi depends on the fixed 0.5 probability threshold.
+  checkpoint_monitors:
+    val/crps: min
+    val/loss: min
+    val/csi: max
+  early_stopping_monitor: val/crps # only used if early_stopping_patience is set
+  early_stopping_mode: min
 
 model:
   class_path: rainpro.modules.rainpro8.RainPro8Module

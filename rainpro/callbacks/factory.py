@@ -1,4 +1,5 @@
 from datetime import timedelta
+from typing import Literal
 
 from lightning import Callback
 from lightning.pytorch.callbacks import (
@@ -17,23 +18,31 @@ def create_callbacks(
     num_animations: int | None,
     animation_bounds: list[float] | None = None,
     checkpoint_interval_minutes: float | None = 30,
+    checkpoint_monitors: dict[str, Literal["min", "max"]] | None = None,
+    early_stopping_monitor: str = "val/loss",
+    early_stopping_mode: Literal["min", "max"] = "min",
 ) -> list[Callback]:
-    callbacks = [
-        LogPlots(),
-        LearningRateMonitor(),
-        # Model selection: the best epoch by val/loss. Only ever written when
-        # validation runs, i.e. at epoch end.
-        ModelCheckpoint(
-            dirpath=ckpt_path,
-            filename="best",
-            monitor="val/loss",
-            mode="min",
-            save_top_k=1,
-            save_on_train_epoch_end=False,
-            save_last=False,
-            enable_version_counter=False,
-        ),
-    ]
+    callbacks: list[Callback] = [LogPlots(), LearningRateMonitor()]
+
+    # Model selection. Only ever written when validation runs, i.e. at epoch
+    # end. With no `checkpoint_monitors`, a single `best.ckpt` by val/loss (the
+    # SEVIR setup). Otherwise one `best_<metric>.ckpt` per monitored metric,
+    # e.g. {"val/crps": "min", "val/loss": "min"} -> best_crps.ckpt +
+    # best_loss.ckpt, so the selection rule is fixed up front rather than
+    # picked after seeing which checkpoint scores best on test.
+    for monitor, mode in (checkpoint_monitors or {"val/loss": "min"}).items():
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=ckpt_path,
+                filename="best" if checkpoint_monitors is None else f"best_{monitor.split('/')[-1]}",
+                monitor=monitor,
+                mode=mode,
+                save_top_k=1,
+                save_on_train_epoch_end=False,
+                save_last=False,
+                enable_version_counter=False,
+            )
+        )
 
     if checkpoint_interval_minutes is not None:
         # Resume point on a wall-clock interval, deliberately independent of
@@ -64,7 +73,9 @@ def create_callbacks(
     if early_stopping_patience is not None:
         callbacks.append(
             EarlyStopping(
-                monitor="val/loss", mode="min", patience=early_stopping_patience
+                monitor=early_stopping_monitor,
+                mode=early_stopping_mode,
+                patience=early_stopping_patience,
             )
         )
 

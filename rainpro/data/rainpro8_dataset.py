@@ -108,8 +108,12 @@ class RainPro8Dataset(Dataset):
         self.latlon_names = latlon_names or {}
         self.fill_value = fill_value
         self.rng_seed = rng_seed
-        self.epoch = 0  # bump via `set_epoch()` (e.g. from a Lightning hook) to vary
-        # augmentation across epochs; not required for correctness.
+        # Bumped via `set_epoch()` (`RainPro8Module.on_train_epoch_start`) to vary
+        # the jitter draw across epochs. Lives in shared memory, not a plain int:
+        # with `persistent_workers=True` each worker keeps its own copy of this
+        # Dataset for the whole run, so a plain attribute set in the main process
+        # never reaches them and every sample would get the same crop every epoch.
+        self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
 
         self._datasets: dict[str, xr.Dataset] = {}
         self._regridders: dict[str, NearestNeighborRegridder] = {}
@@ -134,8 +138,12 @@ class RainPro8Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.init_times)
 
+    @property
+    def epoch(self) -> int:
+        return int(self._epoch)
+
     def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
+        self._epoch.fill_(epoch)
 
     def _rng_for_index(self, index: int) -> np.random.Generator:
         # A per-(seed, epoch, index) RNG rather than a single `self._rng` consumed

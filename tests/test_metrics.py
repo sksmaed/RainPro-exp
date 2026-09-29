@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from rainpro.metrics.contingency import ContingencyMetrics
+from rainpro.metrics.csi import CriticalSuccessIndex
 from rainpro.metrics.fss import FractionsSkillScore
 from rainpro.metrics.probabilistic import CRPS, BrierScore
 from rainpro.metrics.regression import LeadTimeMAEMSE
@@ -42,6 +43,19 @@ def test_contingency_fbi_pod_far_hand_computed():
     assert full["FBI"].item() == pytest.approx((1 + 1) / (1 + 0))  # 2.0
     assert full["POD"].item() == pytest.approx(1 / (1 + 0))  # 1.0
     assert full["FAR"].item() == pytest.approx(1 / (1 + 1))  # 0.5
+
+
+def test_csi_excludes_nan_target():
+    # Same grid as the contingency test above: hit at (0,0), false alarm at
+    # (0,1), forecast echo over a NaN target at (1,0) (excluded, not a false
+    # alarm), correct negative at (1,1) -> CSI = 1 / (1 + 1).
+    target = _tensor([[35.0, 20.0], [float("nan"), 20.0]])
+    forecast = _tensor([[35.0, 35.0], [35.0, 20.0]])
+
+    metric = CriticalSuccessIndex(num_lead_times=1, thresholds=[30.0])
+    metric.update(EvalOutputs(forecast=forecast, target=target))
+
+    assert metric.compute().item() == pytest.approx(0.5)
 
 
 def test_fss_window1_is_not_csi_but_matches_its_own_closed_form():

@@ -35,7 +35,7 @@ Tail 假設（codebase 其他地方都沒寫，這裡明確講）：低於第一
 ### FSS 視窗定義與 NaN 遮罩
 
 - FSS 的「1/2/4/8 格」鄰域，實作為正方形視窗邊長（N×N），不是半徑。
-- `target` 在 QPESUMS 覆蓋範圍外是 NaN（`rainpro/data/rainpro8_dataset.py`，`keep_nan=True`）。現有 `CriticalSuccessIndex`（`rainpro/metrics/csi.py`）沒有遮罩 NaN——`NaN >= threshold` 算 False，NaN 像素會被當成「觀測無雨」計入，可能讓覆蓋缺口區域的 FAR 被抬高。**刻意決定**：不動 `CriticalSuccessIndex`（避免動到已經跑過、可能已經在比較的 CSI 數字），只有新 metrics（`ContingencyMetrics`、`FractionsSkillScore`、`LeadTimeMAEMSE`）遮罩 `~isnan(target)`。這是 CSI 與新 metrics 之間刻意保留的不一致，不是要修的 bug。
+- `target` 在 QPESUMS 覆蓋範圍外是 NaN（`rainpro/data/rainpro8_dataset.py`，`keep_nan=True`）。所有 metrics（`CriticalSuccessIndex`、`ContingencyMetrics`、`FractionsSkillScore`、`LeadTimeMAEMSE`、CRPS/Brier）都遮罩 `~isnan(target)`。`CriticalSuccessIndex` 原本沒有遮罩（`NaN >= threshold` 算 False，NaN 像素被當成「觀測無雨」、其上的預報回波算 false alarm），起初為了不改動已跑過的 CSI 數字而刻意保留；在 `val/csi` 被拿來存 `best_csi.ckpt` 後改為遮罩。**因此修正前的 run 的 CSI 數字不能和修正後的直接比較**（jitter 越大、target 落出覆蓋範圍越多，差異越大）。
 
 ### FSS(window=1) ≠ CSI（曾經寫錯過一次）
 

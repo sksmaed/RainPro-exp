@@ -6,12 +6,15 @@ with STA_H8 and GFS each togglable (`include_satellite`, `include_gfs`; see
 from __future__ import annotations
 
 import datetime
+import json
+import os
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 from lightning.pytorch import LightningDataModule
+from lightning.pytorch.utilities import rank_zero_info
 from torch.utils.data import DataLoader
 
 from rainpro.data import sta_h8_raw
@@ -66,6 +69,65 @@ def cycle_split(
         cur = cur + pd.Timedelta(days=train_days + val_days + test_days)
 
     return times
+
+
+def _zarr_written_time_positions(store_path: str, band: str) -> set[int]:
+    """Time positions of `band` whose chunk was actually written to a
+    scripts/compress_sta_h8_taiwan.py store.
+
+    That script lays out a complete hourly time axis and only writes the
+    (time, band) frames that exist and pass validation, leaving the rest at
+    the array's NaN fill_value -- so the store's `time` coordinate alone says
+    nothing about availability. With its (1, y, x) chunking every frame is
+    exactly one chunk, and an unwritten one has no chunk on disk, so listing
+    the chunk directory answers this without reading any pixel data (a full
+    year is hundreds of GB decompressed)."""
+    with open(os.path.join(store_path, band, "zarr.json")) as f:
+        meta = json.load(f)
+    encoding = meta.get("chunk_key_encoding", {})
+    separator = encoding.get("configuration", {}).get("separator", "/")
+    chunk_t = meta["chunk_grid"]["configuration"]["chunk_shape"][0]
+    if encoding.get("name", "default") != "default" or separator != "/" or chunk_t != 1:
+        raise ValueError(
+            f"{store_path}/{band}: expected zarr v3 default '/' chunk keys with one "
+            f"timestep per chunk (scripts/compress_sta_h8_taiwan.py's layout), got "
+            f"chunk_key_encoding={encoding} chunk_shape[0]={chunk_t}"
+        )
+    chunk_dir = os.path.join(store_path, band, "c")
+    if not os.path.isdir(chunk_dir):
+        return set()
+    return {int(name) for name in os.listdir(chunk_dir) if name.isdigit()}
+
+
+def sta_h8_availability(path: str) -> pd.Series:
+    """Bool Series indexed by the store's own time axis (the one
+    `RainPro8Dataset` resolves offsets against): True only where all 9 bands
+    have a real frame. A timestep missing any band would otherwise reach the
+    model as `fill_value` (0, i.e. 180 K after normalization -- the coldest
+    cloud top, not "no data")."""
+    if _is_zarr_store(path):
+        with xr.open_zarr(path, consolidated=False) as ds:
+            times = pd.DatetimeIndex(ds["time"].values)
+        valid = np.ones(len(times), dtype=bool)
+        for band in sta_h8_raw.BANDS:
+            band_written = np.zeros(len(times), dtype=bool)
+            band_written[sorted(_zarr_written_time_positions(path, band))] = True
+            valid &= band_written
+        return pd.Series(valid, index=times)
+
+    # Raw `.btp` tree: `sta_h8_raw.open_sta_h8_raw` puts every timestamp with
+    # *any* band on its time axis. A wrong-sized file is read as NaN at load
+    # time (`_load_or_nan`), so check size here too -- a stat, not a read.
+    file_index, times = sta_h8_raw.scan_files(path)
+    expected_bytes = sta_h8_raw.IX * sta_h8_raw.IY * 4
+    valid = [
+        all(
+            (t, band) in file_index and os.path.getsize(file_index[(t, band)]) == expected_bytes
+            for band in sta_h8_raw.BANDS
+        )
+        for t in times
+    ]
+    return pd.Series(valid, index=pd.DatetimeIndex(times), dtype=bool)
 
 
 class RainPro8DataModule(LightningDataModule):
@@ -166,37 +228,31 @@ class RainPro8DataModule(LightningDataModule):
             self.split_times[split] = [t for t in self.split_times[split] if t in available]
 
         # STA_H8's real archive has large fully-missing stretches (e.g. ~2
-        # months at the start of 2021, see scripts/inspect_sta_h8_times.py) on
-        # top of its per-timestamp availability -- unlike the per-pixel
-        # radar-coverage case above, this isn't a "some fraction missing"
-        # situation but whole init_times where *every* `satellite_8km` offset
-        # would silently come back as `fill_value` (see `RainPro8Dataset.
-        # _read_source`'s out-of-tolerance branch). Drop those init_times
-        # instead of training on satellite input that's entirely padding.
-        # `sta_h8_path` is a comma-separated list (usually length 1) of either
-        # raw STA_H8 directory roots (read straight from `.btp` files,
-        # rainpro.data.sta_h8_raw) or zarr v3 stores from
-        # scripts/compress_sta_h8_taiwan.py -- same detection and same
-        # comma-separated-multi-store convention `RainPro8Dataset._get_store`
-        # uses (e.g. one store per quarter, possibly split across
-        # filesystems -- see that script's `--freq quarter`). Either way this
-        # only needs the time index, not the full lazy Dataset
-        # (`RainPro8Dataset._get_store` would additionally build regridders
-        # etc.), so it's read directly here.
+        # months at the start of 2021, see scripts/inspect_sta_h8_times.py)
+        # plus scattered missing hours/bands. Any `satellite_8km` offset that
+        # resolves to a missing frame reaches the model as `fill_value`, so
+        # drop those init_times. `sta_h8_path` is a comma-separated list
+        # (usually length 1) of either raw STA_H8 directory roots or zarr v3
+        # stores from scripts/compress_sta_h8_taiwan.py -- same detection and
+        # multi-store convention as `RainPro8Dataset._get_store`.
+        #
+        # Checking the time axis alone is not enough: the zarr stores carry a
+        # complete hourly axis with NaN frames wherever no file existed, and
+        # the raw reader lists a timestamp if *any* band exists. So each
+        # offset is resolved against the full axis exactly as the Dataset
+        # does (same nearest/tolerance lookup), then the frame it lands on
+        # must have all 9 bands (`sta_h8_availability`).
         sta_h8_path = self.data_root.get("sta_h8")
         if self.include_satellite and sta_h8_path is not None:
-            sat_times_parts: list[pd.DatetimeIndex] = []
-            for p in split_sta_h8_paths(sta_h8_path):
-                if _is_zarr_store(p):
-                    with xr.open_zarr(p, consolidated=False) as sat_ds:
-                        sat_times_parts.append(pd.DatetimeIndex(sat_ds["time"].values))
-                else:
-                    _, times = sta_h8_raw.scan_files(p)
-                    sat_times_parts.append(pd.DatetimeIndex(times))
-            sat_index = sat_times_parts[0]
-            for part in sat_times_parts[1:]:
-                sat_index = sat_index.union(part)
-            sat_index = sat_index.sort_values()
+            availability = pd.concat(
+                [sta_h8_availability(p) for p in split_sta_h8_paths(sta_h8_path)]
+            ).sort_index()
+            sat_index = availability.index
+            sat_valid = availability.to_numpy()
+            rank_zero_info(
+                f"[STA_H8] {int(sat_valid.sum())}/{len(sat_valid)} timesteps on the store's "
+                f"time axis have all {len(sta_h8_raw.BANDS)} bands"
+            )
             offsets = self.sources["satellite_8km"].offsets_min
             tolerance = pd.Timedelta(TIME_TOLERANCE["satellite_8km"])
             for split in self.split_times:
@@ -204,7 +260,12 @@ class RainPro8DataModule(LightningDataModule):
                 covered = np.ones(len(times), dtype=bool)
                 for offset in offsets:
                     query = times + pd.Timedelta(minutes=offset)
-                    covered &= sat_index.get_indexer(query, method="nearest", tolerance=tolerance) != -1
+                    pos = sat_index.get_indexer(query, method="nearest", tolerance=tolerance)
+                    covered &= (pos >= 0) & sat_valid[np.maximum(pos, 0)]
+                rank_zero_info(
+                    f"[STA_H8] {split}: kept {int(covered.sum())}/{len(times)} init_times "
+                    f"with complete satellite input"
+                )
                 self.split_times[split] = list(times[covered])
 
     def _dataloader(self, split: Literal["train", "val", "test"]) -> DataLoader:

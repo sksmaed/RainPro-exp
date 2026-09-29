@@ -5,12 +5,10 @@ pattern, but keeps hits/misses/false_alarms/correct_negatives as four
 separate buffers -- CSI's `false_guesses` combines misses+false_alarms via
 XOR, which is enough for CSI but not enough to separate POD from FAR.
 
-Unlike `CriticalSuccessIndex`, this masks out pixels where `target` is NaN
+Like `CriticalSuccessIndex`, this masks out pixels where `target` is NaN
 (QPESUMS out-of-coverage, see `rainpro.data.rainpro8_dataset`, `keep_nan=True`
-for `target_2km`) -- `CriticalSuccessIndex` does not do this today (`NaN >=
-threshold` evaluates `False`, silently counted as "observed no-rain"). This
-is an intentional, documented divergence, not a fix retroactively applied to
-CSI's already-reported numbers.
+for `target_2km`). CSI only started doing so later, so CSI numbers from runs
+before that change are not comparable with this metric's.
 """
 
 import torch

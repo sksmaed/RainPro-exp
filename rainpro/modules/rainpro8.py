@@ -103,6 +103,13 @@ class RainPro8Module(L.LightningModule):
 
         return self.model.predict(x_4km, x_8km, x_16km, target, eval_request)
 
+    def on_train_epoch_start(self):
+        # Re-keys RainPro8Dataset's per-sample jitter RNG so each epoch draws a
+        # new crop per sample (see `RainPro8Dataset._epoch`).
+        dataset = self.trainer.train_dataloader.dataset
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(self.current_epoch)
+
     def training_step(self, batch, batch_idx):
         loss = self(batch, EvalRequest(only_loss=True, need_loss=True))
         self.log("train/loss", loss, on_epoch=True, sync_dist=True)
