@@ -35,7 +35,10 @@
 trainer:
   precision: '32'
   gradient_clip_val: 1.0
-  max_epochs: 50 # paper trains for 100k steps (batch_size=16); tune to your dataset size
+  # Upper bound only; early stopping on val/crps (below) decides when to stop.
+  # The 2021 obs-only run's val CRPS/Brier plateaued around epoch 20-30
+  # (~2k optimizer steps/epoch at 33k STA_H8-filtered train samples).
+  max_epochs: 40
   log_every_n_steps: 50
   project: rainpro8_tw
   devices: [0]
@@ -49,8 +52,10 @@ trainer:
     val/crps: min
     val/loss: min
     val/csi: max
-  early_stopping_monitor: val/crps # only used if early_stopping_patience is set
+  early_stopping_monitor: val/crps
   early_stopping_mode: min
+  early_stopping_patience: 8 # val set is ~1k highly correlated samples, so
+  # epoch-to-epoch val/crps is noisy -- a short patience stops on noise.
 
 model:
   class_path: rainpro.modules.rainpro8.RainPro8Module
@@ -96,7 +101,12 @@ data:
   cycle_blackout_hours: 12
   center_lat: 23.7
   center_lon: 121.0
-  train_jitter_km: 256
+  # 0 = clean control run. The paper's +/-256 km assumes a source domain much
+  # larger than the canvas; QPESUMS is ~565x780 km with the 512 km target
+  # nearly touching its east edge, so +/-256 km put ~26% of each training
+  # target outside radar coverage (masked) while val/test use 0. Next to try:
+  # 32, 64 km.
+  train_jitter_km: 0
   batch_size: 16
   # `eval_batch_size` deliberately left unset: `RainPro8DataModule` then falls
   # back to `batch_size`, so the two stay equal even when only `batch_size` is
