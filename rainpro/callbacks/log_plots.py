@@ -155,4 +155,7 @@ class LogPlots(pl.Callback):
             columns=["bucket_dbz", "lead_time", "bin", "mean_pred", "obs_freq", "count"],
             data=metric.full_table(),
         )
-        log_dict[f"{split}/reliability"] = table
+        # Not "{split}/reliability": the module's `log_dict(metrics)` already logs
+        # the scalar (ECE) under that key, and W&B can't chart a key holding
+        # both a scalar and a Table.
+        log_dict[f"{split}/reliability_table"] = table
