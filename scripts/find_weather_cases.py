@@ -8,14 +8,26 @@ calendar rules plus the radar field on the target_2km canvas (read exactly as
                 storms below), ranked by echo coverage >= 20 dBZ.
   meiyu         May 15 - Jun 30, outside typhoon windows, echo organised in an
                 elongated SW-NE band, ranked by coverage >= 20 dBZ.
-  summer_conv   Jun 15 - Sep 15 local afternoon (12-18 h), outside typhoon
+  summer_conv   Jun 15 - Sep 15 local afternoon (13-17 h), outside typhoon
                 windows, many separate >= 35 dBZ cells rather than a band,
-                ranked by coverage >= 40 dBZ.
+                and NOT widespread (coverage >= 20 dBZ at most
+                `--conv-max-f20`, default 15%): without that cap the ranking
+                picks large organised systems that merely happen to be
+                there in the afternoon. Ranked by coverage >= 40 dBZ.
   winter_front  Nov - Mar, an elongated band that is mostly stratiform
                 (little of the >= 20 dBZ area reaches 40 dBZ), ranked by
                 coverage >= 20 dBZ.
-  no_rain       almost no echo at t0 AND through the whole 6 h target
-                window, ranked cleanest first.
+  no_rain       at most `--no-rain-f20` (default 0.1%) of the canvas >= 20
+                dBZ at t0 AND through the whole 6 h target window, ranked by
+                the wettest of those frames' coverage >= 5 dBZ. A 512 km canvas
+                around Taiwan almost always has a shower somewhere, so truly
+                echo-free 6 h windows essentially don't exist.
+
+Frames whose maximum exceeds `--max-valid-dbz` (default 75) contain values
+no precipitation produces -- a data error, not weather. Init times with such
+a frame in t0 .. +6 h are excluded from every regime, and the script reports
+how many of the frames it read have them (they also enter training as
+top-bucket targets).
 
 Band shape comes from the >= 20 dBZ pixels' coordinate covariance:
 elongation = sqrt(major / minor eigenvalue), orientation = major axis angle
@@ -117,6 +129,12 @@ def main() -> None:
                      help="added to store timestamps to get Taiwan local time (0 if already local)")
     ap.add_argument("--typhoon", action="append", default=None,
                      help=f"repeatable NAME:START:END (dates inclusive); default {DEFAULT_TYPHOONS}")
+    ap.add_argument("--conv-max-f20", type=float, default=0.15,
+                     help="summer_conv: max coverage >= 20 dBZ (keeps out widespread systems)")
+    ap.add_argument("--no-rain-f20", type=float, default=1e-3,
+                     help="no_rain: max coverage >= 20 dBZ allowed in any frame t0 .. +6 h")
+    ap.add_argument("--max-valid-dbz", type=float, default=75.0,
+                     help="frames with a pixel above this are treated as data errors")
     ap.add_argument("--ckpt-dir", default="runs/rainpro8_2021_obs_only/checkpoints",
                      help="only used to print the infer_visualize.py commands")
     ap.add_argument("--csv", default=None, help="optional: features of every candidate init time")
@@ -157,10 +175,18 @@ def main() -> None:
     def at(k, p):  # per-frame feature, NaN where the frame is missing
         return np.where(p >= 0, feats[k][np.clip(np.searchsorted(unique, p), 0, len(unique) - 1)], np.nan)
 
+    bad = feats["max_dbz"] > args.max_valid_dbz
+    bad_times = handle.time_index[unique[bad]]
+    print(f"\nframes with max > {args.max_valid_dbz:g} dBZ (data errors): {int(bad.sum())}/{len(unique)}"
+          + (f", e.g. {', '.join(f'{t:%Y-%m-%d %H:%M}' for t in bad_times[:5])}" if bad.any() else ""))
+    if bad.any():
+        print(f"   their max values: {np.round(np.sort(feats['max_dbz'][bad])[::-1][:10], 1).tolist()}")
+
     t0 = pos[:, 0]
     table = pd.DataFrame({k: at(k, t0) for k in FEATURES}, index=inits)
     table["max_f20_6h"] = np.nanmax(at("f20", pos), axis=1)  # t0 .. +6 h
     table["max_f5_6h"] = np.nanmax(at("f5", pos), axis=1)
+    table["bad_frame_6h"] = (at("max_dbz", pos) > args.max_valid_dbz).any(axis=1)
     local = inits + pd.Timedelta(hours=args.tz_offset_hours)
     table["local_time"] = local
 
@@ -187,29 +213,32 @@ def main() -> None:
     md = local.month * 100 + local.day
     hour = local.hour
     band = (table["elongation"] >= 2.0) & table["orientation"].between(10, 80)
+    clean = ~table["bad_frame_6h"]
     with np.errstate(invalid="ignore", divide="ignore"):
         convective_share = table["f40"] / table["f20"]
     regimes = {
         "typhoon": (table["typhoon"] != "", "f20", False),
         "meiyu": ((md >= 515) & (md <= 630) & ~near_typhoon & band & (table["f20"] >= 0.02), "f20", False),
-        "summer_conv": ((md >= 615) & (md <= 915) & (hour >= 12) & (hour <= 18) & ~near_typhoon
-                        & (table["n_cells35"] >= 10) & (table["elongation"] < 3.0), "f40", False),
+        "summer_conv": ((md >= 615) & (md <= 915) & (hour >= 13) & (hour <= 17) & ~near_typhoon
+                        & (table["n_cells35"] >= 10) & (table["elongation"] < 3.0)
+                        & (table["f20"] <= args.conv_max_f20), "f40", False),
         "winter_front": (((local.month >= 11) | (local.month <= 3)) & band & (table["f20"] >= 0.01)
                          & (convective_share < 0.1), "f20", False),
-        "no_rain": ((table["max_f20_6h"] < 1e-4) & (table["max_f5_6h"] < 5e-3), "max_f5_6h", True),
+        "no_rain": (table["max_f20_6h"] <= args.no_rain_f20, "max_f5_6h", True),
     }
 
     data_root = json.dumps(dm.data_root)
     aliases = json.dumps(dm.variable_aliases or {})
     for name, (mask, score, ascending) in regimes.items():
-        cand = table[mask.to_numpy() if hasattr(mask, "to_numpy") else mask].sort_values(score, ascending=ascending)
+        mask = np.asarray(mask) & clean.to_numpy()
+        cand = table[mask].sort_values(score, ascending=ascending)
         picks: list[pd.Timestamp] = []
         for t in cand.index:
             if len(picks) == args.top_k:
                 break
             if all(abs(t - p) >= pd.Timedelta(hours=args.min_gap_hours) for p in picks):
                 picks.append(t)
-        print(f"\n==================== {name}: {int(np.asarray(mask).sum())} candidates ====================")
+        print(f"\n==================== {name}: {int(mask.sum())} candidates ====================")
         if not picks:
             print("   none in this split -- try --split all, or loosen the rule")
             continue

@@ -48,19 +48,22 @@ class LogAnimations(L.Callback):
         targets = outputs.target
         assert targets is not None
         targets = targets.cpu()
+        baselines = outputs.baseline.cpu() if outputs.baseline is not None else None
 
-        for pred, target in zip(preds, targets):
+        for i, (pred, target) in enumerate(zip(preds, targets)):
             if len(self.animations) >= self.num_animations:
                 break
 
             if (target >= self.min_interesting_value).sum() < self.min_interesting_count:
                 continue
 
-            pred = self._colorize(pred)
-            target = self._colorize(target)
+            panels = [self._colorize(pred), self._colorize(target)]
+            if baselines is not None:
+                # model | optical-flow baseline | ground truth
+                panels.insert(1, self._colorize(baselines[i]))
 
             # concatenate side-by-side (W dimension)
-            animation = torch.cat([pred, target], dim=2)
+            animation = torch.cat(panels, dim=2)
 
             # upsample for visibility
             animation = torch.nn.functional.interpolate(
@@ -97,7 +100,9 @@ class LogAnimations(L.Callback):
 
     def _colorize(self, rain_rates: Tensor) -> Tensor:
         """Convert (T, 1, H, W) → (T, H, W, 3) uint8"""
-        rain_np = rain_rates.squeeze(1).cpu().numpy()
+        # Mask NaN (e.g. QPESUMS out-of-coverage) so it takes the colormap's
+        # "bad" colour; BoundaryNorm would otherwise bin it as the top bucket.
+        rain_np = np.ma.masked_invalid(rain_rates.squeeze(1).cpu().numpy())
         rgba = self.cmap(self.norm(rain_np))
 
         alpha = rgba[..., 3:4]
@@ -141,7 +146,11 @@ def _vil_cmap():
 
 
 def _precip_cmap(bounds: list[float]):
-    """Generic precipitation-intensity colormap for arbitrary (e.g. mm/h) bounds."""
+    """Generic precipitation-intensity colormap for arbitrary (e.g. mm/h, dBZ)
+    bounds. Below the lowest bound is no echo (transparent, rendered black by
+    `_colorize`); NaN is grey."""
     cmap = mpl.colormaps["turbo"].resampled(len(bounds) - 1)
+    cmap.set_under((0.0, 0.0, 0.0, 0.0))
+    cmap.set_bad((0.5, 0.5, 0.5, 1.0))
     norm = mpl.colors.BoundaryNorm(bounds, cmap.N)
     return cmap, norm

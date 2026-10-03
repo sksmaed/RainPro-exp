@@ -5,6 +5,7 @@ import torch
 from lightning.pytorch.utilities.types import OptimizerLRScheduler
 from torchmetrics import MetricCollection
 
+from rainpro.baselines.optical_flow import OpticalFlowBaseline
 from rainpro.data.rainpro8_datamodule import RainPro8DataModule
 from rainpro.data.rainpro8_sources import context_sizes, tier_channels
 from rainpro.loss.ordinal_consistent import OrdinalConsistentLoss, taiwan_dbz_buckets
@@ -22,6 +23,8 @@ from rainpro.network.rainpro8 import RainPro, StackTimeAndChannels
 # so the *choice* of evaluation intensities is what's preserved, not the
 # literal paper values.
 CSI_THRESHOLDS_DBZ = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0]
+
+OPTFLOW_STATE_PREFIX = "test_optflow_metrics."
 
 
 def stack_sources(
@@ -61,6 +64,10 @@ class RainPro8Module(L.LightningModule):
         learning_rate: float = 3e-4,
         weight_decay: float = 0.1,
         betas: tuple[float, float] = (0.9, 0.999),
+        # Score an optical-flow extrapolation baseline on the same test batches
+        # and log it under `test_optflow/` (see rainpro/baselines/optical_flow.py).
+        # Test only; costs no parameters, so checkpoints are unaffected.
+        optical_flow_baseline: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters(ignore="data")
@@ -126,6 +133,12 @@ class RainPro8Module(L.LightningModule):
         self.val_metrics = create_metrics(self.T_out, "val")
         self.test_metrics = create_metrics(self.T_out, "test")
 
+        self.optical_flow = None
+        self.test_optflow_metrics = None
+        if optical_flow_baseline:
+            self.optical_flow = OpticalFlowBaseline.from_sources(self.sources, data.norm_bounds)
+            self.test_optflow_metrics = create_metrics(self.T_out, "test_optflow")
+
     def forward(
         self, batch: dict[str, torch.Tensor], eval_request: EvalRequest
     ) -> EvalOutputs | torch.Tensor:
@@ -153,7 +166,24 @@ class RainPro8Module(L.LightningModule):
         return self._shared_eval(batch, "val")
 
     def test_step(self, batch, batch_idx):
-        return self._shared_eval(batch, "test")
+        eval_outputs = self._shared_eval(batch, "test")
+        if self.optical_flow is not None:
+            eval_outputs.baseline = self._eval_optical_flow(batch, eval_outputs.target)
+        return eval_outputs
+
+    def _eval_optical_flow(self, batch: dict, target: torch.Tensor) -> torch.Tensor:
+        forecast = self.optical_flow(batch)
+        edges = torch.tensor(
+            [b.min for b in taiwan_dbz_buckets()], device=forecast.device
+        ).view(1, 1, -1, 1, 1)
+        # Deterministic forecast as a step CDF (all mass on its own value),
+        # the same "<= edge" convention CRPS/Brier use for the target -- as for
+        # persistence in scripts/eval_persistence.py.
+        self.test_optflow_metrics.update(
+            EvalOutputs(forecast=forecast, target=target, probs=(forecast <= edges).float())
+        )
+        self.log_dict(self.test_optflow_metrics)
+        return forecast
 
     def predict_step(
         self,
@@ -190,6 +220,20 @@ class RainPro8Module(L.LightningModule):
         metrics.update(eval_outputs)
         self.log_dict(metrics)
         return eval_outputs
+
+    # The baseline's metric buffers (bucket edges etc.) are constants, so keep
+    # them out of checkpoints: a checkpoint then loads (strictly) with the
+    # baseline on or off, including every checkpoint saved before it existed.
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        state = checkpoint["state_dict"]
+        for key in [k for k in state if k.startswith(OPTFLOW_STATE_PREFIX)]:
+            del state[key]
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        state = checkpoint["state_dict"]
+        for key, value in self.state_dict().items():
+            if key.startswith(OPTFLOW_STATE_PREFIX):
+                state.setdefault(key, value)
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
         # Paper Sec. 4: AdamW, static lr=3e-4, weight_decay=0.1, betas=(0.9, 0.999).

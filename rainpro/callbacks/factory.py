@@ -17,6 +17,7 @@ def create_callbacks(
     early_stopping_patience: int | None,
     num_animations: int | None,
     animation_bounds: list[float] | None = None,
+    animation_min_value: float = 160,
     checkpoint_interval_minutes: float | None = 30,
     checkpoint_monitors: dict[str, Literal["min", "max"]] | None = None,
     early_stopping_monitor: str = "val/loss",
@@ -67,7 +68,11 @@ def create_callbacks(
 
     if num_animations is not None and num_animations > 0:
         callbacks.append(
-            LogAnimations(num_animations=num_animations, bounds=animation_bounds),
+            LogAnimations(
+                num_animations=num_animations,
+                bounds=animation_bounds,
+                min_interesting_value=animation_min_value,
+            ),
         )
 
     if early_stopping_patience is not None:

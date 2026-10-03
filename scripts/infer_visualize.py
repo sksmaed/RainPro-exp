@@ -2,9 +2,11 @@
 All map figures put lead time along the columns (default +10/+20/+30 min,
 +1/+2/+3/+6 h, see `--lead-times`) and what is being compared down the rows.
 
-  <stem>_overview.png   ground truth + one row per checkpoint (expected dBZ).
+  <stem>_overview.png   ground truth + optical flow + one row per checkpoint
+                        (expected dBZ).
   <stem>_<ckpt>.png     one per checkpoint, rows: ground truth | persistence |
-                        expected dBZ | 0.5 forecast | P(>20 dBZ) | P(>34 dBZ).
+                        optical flow | expected dBZ | 0.5 forecast |
+                        P(>20 dBZ) | P(>34 dBZ).
   <stem>_hist.png       the predicted distribution at two grid points, picked
                         automatically at `--hist-lead`: where GT is largest,
                         and where it is smallest (`--min-point`). Top row: GT
@@ -41,6 +43,11 @@ so the exceedance curve is `S_k = 1 - probs = P(Y > t_k)` over the 16
     offset 0) so the model-facing datamodule keeps its 36 target steps --
     `frames_out` sizes the network, so changing that spec would build a
     checkpoint-incompatible model.
+  * optical flow -- `rainpro.baselines.optical_flow`, the extrapolation
+    baseline `RainPro8Module.test_step` scores under `test_optflow/`: motion
+    from the sample's own `radar_4km` frames, t0 advected along it. The
+    honest bar for "does the model beat moving the echo along": persistence
+    only shows what standing still costs.
 
 `expected_dbz` representative values are judgement calls, both conservative:
   * LOW_BIN_DBZ = 0, not the bin's 2.5 dBZ midpoint -- QPESUMS clear sky reads
@@ -52,7 +59,7 @@ so the exceedance curve is `S_k = 1 - probs = P(Y > t_k)` over the 16
 
 Also prints two per-lead-time tables for this single case -- anecdotal, not a
 substitute for validation-set scores (scripts/eval_persistence.py):
-  * CSI, 0.5 forecast vs. persistence, against GT.
+  * CSI, 0.5 forecast vs. persistence vs. optical flow, against GT.
   * Probability mass vs. event area, `--mass-thresholds`: sum over pixels of
     P(Y > t) x 4 km^2 against the GT area >= t (both over GT-valid pixels).
     Mass close to the GT area but a diffuse P map -> the model knows how much
@@ -90,6 +97,7 @@ mpl.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from rainpro.baselines.optical_flow import OpticalFlowBaseline  # noqa: E402
 from rainpro.data.rainpro8_dataset import RainPro8Dataset  # noqa: E402
 from rainpro.data.rainpro8_datamodule import RainPro8DataModule  # noqa: E402
 from rainpro.loss.ordinal_consistent import taiwan_dbz_buckets  # noqa: E402
@@ -443,6 +451,10 @@ def main() -> None:
     if np.isnan(t0).all():
         print("!! t0 QPESUMS frame is entirely NaN -- persistence column will be blank")
     persistence = np.broadcast_to(t0, truth.shape)
+    # Checkpoint-independent, so computed once. Built from the datamodule's
+    # sources/norm_bounds -- the same ones the batch above was read with.
+    optical_flow = OpticalFlowBaseline.from_sources(datamodule.sources, datamodule.norm_bounds)
+    flow = optical_flow(batch)[0, lead_idx, 0].cpu().numpy()  # (n_lead, H, W) dBZ
     truth_hist = batch["target_2km"][0, hist_idx, 0].cpu().numpy()
     points = pick_points(truth_hist, args.min_point)
     print(f"histogram points at {lead_label(args.hist_lead)}: "
@@ -475,6 +487,7 @@ def main() -> None:
         rows: list[tuple[str, np.ndarray, str]] = [
             ("ground truth", truth, "dbz"),
             ("persistence (t0)", persistence, "dbz"),
+            ("optical flow", flow, "dbz"),
             ("expected dBZ", expected, "dbz"),
             ("0.5 forecast", forecast, "dbz"),
             *[(f"P(>{t:g} dBZ)", exceed[:, k], "prob") for t, k in zip(prob_thresholds, prob_idx)],
@@ -482,12 +495,11 @@ def main() -> None:
         plot_grid(f"{stem}_{ckpt_label}{ext}", f"RainPro-8 TW  |  {ckpt_label}  |  init {init_str}",
                   lead_times, rows)
 
-        header = "  lead    " + "  ".join(f"CSI{t:g} fcst/pers" for t in prob_thresholds)
+        header = "  lead    " + "  ".join(f"CSI{t:g} fcst/pers/flow".rjust(19) for t in prob_thresholds)
         print(header)
         for row, lt in enumerate(lead_times):
             cells = [
-                f"{csi(forecast[row], truth[row], t):.3f}/{csi(persistence[row], truth[row], t):.3f}"
-                .rjust(len(f"CSI{t:g} fcst/pers"))
+                "/".join(f"{csi(f[row], truth[row], t):.3f}" for f in (forecast, persistence, flow)).rjust(19)
                 for t in prob_thresholds
             ]
             print(f"  +{lt:<4}   " + "  ".join(cells))
@@ -513,7 +525,8 @@ def main() -> None:
         f"{stem}_overview{ext}",
         f"RainPro-8 TW  |  init {init_str}  |  expected dBZ from ordinal probabilities",
         lead_times,
-        [("ground truth", truth, "dbz")] + [(label, res["expected"], "dbz") for label, res in ckpt_results],
+        [("ground truth", truth, "dbz"), ("optical flow", flow, "dbz")]
+        + [(label, res["expected"], "dbz") for label, res in ckpt_results],
     )
     plot_hist(
         f"{stem}_hist{ext}",

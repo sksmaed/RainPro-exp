@@ -43,6 +43,12 @@ trainer:
   project: rainpro8_tw
   devices: [0]
   num_animations: 20
+  # Target is raw dBZ, not SEVIR VIL (0-255), so override the VIL colormap
+  # and its "interesting sample" threshold (160): colour from 15 dBZ in 5 dBZ
+  # steps (below = no echo, black; out of coverage = grey), and animate only
+  # samples whose target reaches 35 dBZ (convective) somewhere.
+  animation_bounds: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65]
+  animation_min_value: 35
   # Model selection, fixed before looking at test results: best_crps.ckpt is
   # THE checkpoint to evaluate (CRPS scores the whole ordinal CDF and masks
   # NaN targets). best_loss / best_csi are kept for analysis only -- val/loss

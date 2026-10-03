@@ -22,6 +22,10 @@ class RainProTrainer(pl.Trainer):
         project: str = "rainpro",
         num_animations: int | None = 20,
         animation_bounds: list[float] | None = None,
+        # Only samples whose target reaches this value somewhere get animated.
+        # Same units as the target: 160 is SEVIR VIL; RainPro-8 (dBZ) sets its
+        # own in rainpro8.yml.
+        animation_min_value: float = 160,
         callbacks: list[pl.Callback] | pl.Callback | None = None,
         auto_requeue: bool = False,
         checkpoint_interval_minutes: float | None = 30,
@@ -37,6 +41,7 @@ class RainProTrainer(pl.Trainer):
             early_stopping_patience,
             num_animations,
             animation_bounds,
+            animation_min_value,
             checkpoint_interval_minutes,
             checkpoint_monitors,
             early_stopping_monitor,

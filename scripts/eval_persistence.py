@@ -1,18 +1,20 @@
-"""Score a checkpoint against 2 km persistence on a whole split, per lead time
-and threshold.
+"""Score a checkpoint against 2 km persistence and an optical-flow
+extrapolation baseline on a whole split, per lead time and threshold.
 
 Persistence = the t0 QPESUMS frame on the target's 2 km grid, repeated for
 every lead time (read through a separate single-source Dataset, exactly as in
 scripts/infer_visualize.py, so the model-facing datamodule keeps its 36
-target steps). Both forecasts go through the same metric classes the
-LightningModule logs, with the same NaN-target masking:
+target steps). Optical flow = `rainpro.baselines.optical_flow` on the batch's
+own `radar_4km` frames, the same baseline `RainPro8Module.test_step` logs
+under `test_optflow/`. All three forecasts go through the same metric classes
+the LightningModule logs, with the same NaN-target masking:
 
   * CSI, FSS (every window), POD / FAR / FBI -- deterministic. The model side
     uses `EvalOutputs.forecast` (the 0.5-threshold pick, values are bucket
     minima, so "forecast >= 35" means the 37 dBZ bucket or above).
-  * CRPS, Brier -- probabilistic. Persistence enters as a step CDF (all mass
-    on its own t0 value), so these compare the model's full distribution with
-    a deterministic baseline on the same footing. Where the 0.5 forecast
+  * CRPS, Brier -- probabilistic. Persistence and optical flow enter as step
+    CDFs (all mass on their own value), so these compare the model's full
+    distribution with deterministic baselines on the same footing. Where the 0.5 forecast
     scores CSI = 0, these still say whether the model has probabilistic skill.
 
 Writes every number to a long-format CSV (source, metric, threshold, window,
@@ -47,6 +49,7 @@ import yaml
 from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from rainpro.baselines.optical_flow import OpticalFlowBaseline  # noqa: E402
 from rainpro.data.rainpro8_datamodule import RainPro8DataModule  # noqa: E402
 from rainpro.data.rainpro8_dataset import RainPro8Dataset  # noqa: E402
 from rainpro.loss.ordinal_consistent import taiwan_dbz_buckets  # noqa: E402
@@ -144,7 +147,11 @@ def main() -> None:
         args.ckpt, data=dm, map_location=args.device, compile_model=False
     ).eval().to(args.device)
 
-    metrics = {src: make_metrics(len(leads)) for src in ("model", "persistence")}
+    # Built from the datamodule, not taken off the module, so it runs whatever
+    # `optical_flow_baseline` the checkpoint was saved with.
+    optical_flow = OpticalFlowBaseline.from_sources(dm.sources, dm.norm_bounds)
+
+    metrics = {src: make_metrics(len(leads)) for src in ("model", "persistence", "optflow")}
     for group in metrics.values():
         for m in group.values():
             m.to(args.device)
@@ -168,8 +175,10 @@ def main() -> None:
             # Step CDF: F(edge) = 1 if the persisted value is <= edge -- the
             # same "<= edge" convention CRPS/Brier use for the target.
             pers_out = EvalOutputs(forecast=pers, target=target, probs=(pers <= edges).float())
+            flow = optical_flow(batch)
+            flow_out = EvalOutputs(forecast=flow, target=target, probs=(flow <= edges).float())
 
-            for src, eo in (("model", model_out), ("persistence", pers_out)):
+            for src, eo in (("model", model_out), ("persistence", pers_out), ("optflow", flow_out)):
                 for m in metrics[src].values():
                     m.update(eo)
             if (i + 1) % 20 == 0 or i + 1 == n_batches:
@@ -213,16 +222,16 @@ def main() -> None:
         (f"FSS20w{fss_window}", "FSS", 20.0, fss_window), ("FBI20", "FBI", 20.0, ""),
         ("FBI35", "FBI", 35.0, ""), ("POD35", "POD", 35.0, ""), ("CRPS", "CRPS", "", ""),
     ]
-    print("\nmodel / persistence")
-    print("  lead  " + "".join(label.rjust(15) for label, *_ in columns))
+    sources = list(metrics)
+    print("\n" + " / ".join(sources))
+    print("  lead  " + "".join(label.rjust(21) for label, *_ in columns))
     for lead in SUMMARY_LEADS:
         if lead not in leads:
             continue
         cells = []
         for _, metric, th, window in columns:
-            m = lookup.get(("model", metric, th, window, lead), float("nan"))
-            p = lookup.get(("persistence", metric, th, window, lead), float("nan"))
-            cells.append(f"{m:.3f}/{p:.3f}".rjust(15))
+            values = [lookup.get((src, metric, th, window, lead), float("nan")) for src in sources]
+            cells.append("/".join(f"{v:.3f}" for v in values).rjust(21))
         print(f"  +{lead:<4}" + "".join(cells))
 
 

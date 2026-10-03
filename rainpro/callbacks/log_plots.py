@@ -1,3 +1,5 @@
+from dataclasses import dataclass, field
+
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.utilities import rank_zero_only
@@ -6,6 +8,21 @@ from typing_extensions import Literal
 import wandb
 from rainpro.metrics.csi import CriticalSuccessIndex
 from rainpro.metrics.probabilistic import ReliabilityAccumulator
+
+# Baseline metric collections drawn on the SAME charts as the model's, as
+# `<split>_<suffix>_metrics` attribute suffix -> legend name. A module without
+# the attribute (or with it set to None) simply has no extra line.
+BASELINES = {"optflow": "optical flow"}
+MODEL_SERIES = "model"
+
+
+@dataclass
+class _Curve:
+    title: str
+    x_name: str
+    y_name: str
+    xs: list
+    series: dict[str, list[float]] = field(default_factory=dict)
 
 
 class LogPlots(pl.Callback):
@@ -26,136 +43,108 @@ class LogPlots(pl.Callback):
             return
 
         log_dict = {"global_step": trainer.global_step}
+        curves: dict[str, _Curve] = {}
 
-        for _, metric in metrics.items():
-            if isinstance(metric, CriticalSuccessIndex):
-                self._log_csi(log_dict, split, metric)
-            elif isinstance(metric, ReliabilityAccumulator):
-                self._log_reliability_table(log_dict, split, metric)
-            elif hasattr(metric, "full"):
-                self._log_pooled(log_dict, split, metric)
+        sources = [(MODEL_SERIES, split, metrics)]
+        for suffix, name in BASELINES.items():
+            baseline = getattr(pl_module, f"{split}_{suffix}_metrics", None)
+            if baseline is not None:
+                sources.append((name, f"{split}_{suffix}", baseline))
+
+        for series, table_prefix, collection in sources:
+            for _, metric in collection.items():
+                if isinstance(metric, CriticalSuccessIndex):
+                    self._add_csi(curves, split, series, metric)
+                elif isinstance(metric, ReliabilityAccumulator):
+                    self._log_reliability_table(log_dict, table_prefix, metric)
+                elif hasattr(metric, "full"):
+                    self._add_pooled(curves, split, series, metric)
+
+        for key, curve in curves.items():
+            log_dict[key] = self._chart(curve)
 
         logger.experiment.log(log_dict)
 
-    def _log_csi(self, log_dict: dict, split: str, metric: CriticalSuccessIndex):
-        all_csi = metric._compute(reduce_mean=False)
-
-        # -----------------------
-        # Mean CSI (over thresholds)
-        # -----------------------
-        mean_csi = all_csi.mean(dim=0)
-        x_values = list(range(1, mean_csi.shape[0] + 1))
-        y_values = mean_csi.cpu().tolist()
-
-        table_mean = wandb.Table(
-            data=[[x, y] for x, y in zip(x_values, y_values)],
-            columns=["Lead Time", "CSI"],
-        )
-
-        log_dict[f"{split}/CSI_mean"] = wandb.plot.line(
-            table_mean,
-            "Lead Time",
-            "CSI",
-            title="CSI-m",
-        )
-
-        # -----------------------
-        # Per-threshold CSI plots + averages
-        # -----------------------
-        for i in range(all_csi.shape[0]):
-            label = metric.padded_names[i]
-
-            y_values = all_csi[i].cpu().tolist()
-            x_values = list(range(1, len(y_values) + 1))
-
+    @staticmethod
+    def _chart(curve: _Curve):
+        """One line (the model alone): the plain `wandb.plot.line` these
+        charts have always been. Model + baselines: one chart, one line each,
+        so they compare directly."""
+        if len(curve.series) == 1:
+            (ys,) = curve.series.values()
             table = wandb.Table(
-                data=[[x, y] for x, y in zip(x_values, y_values)],
-                columns=["Lead Time", "CSI"],
+                data=[[x, y] for x, y in zip(curve.xs, ys)],
+                columns=[curve.x_name, curve.y_name],
             )
-
-            log_dict[f"{split}/CSI/{label}"] = wandb.plot.line(
-                table,
-                "Lead Time",
-                "CSI",
-                title=f"CSI-{label}",
-            )
-
-        # -----------------------
-        # CSI averaged over time vs threshold (line plot)
-        # -----------------------
-        thresholds = [str(t) for t in metric.padded_names]
-        avg_csi_values = [all_csi[i].mean().item() for i in range(all_csi.shape[0])]
-
-        table_thresh = wandb.Table(
-            data=[[t, csi] for t, csi in zip(thresholds, avg_csi_values)],
-            columns=["Threshold", "CSI"],
+            return wandb.plot.line(table, curve.x_name, curve.y_name, title=curve.title)
+        return wandb.plot.line_series(
+            xs=_numeric(curve.xs),
+            ys=list(curve.series.values()),
+            keys=list(curve.series),
+            title=f"{curve.title} ({curve.y_name})",
+            xname=curve.x_name,
         )
 
-        log_dict[f"{split}/CSI_thresholds"] = wandb.plot.line(
-            table_thresh,
-            "Threshold",
-            "CSI",
-            title="CSI per Threshold",
-        )
+    @staticmethod
+    def _add(curves: dict, key: str, series: str, title: str, x_name: str, y_name: str, xs, ys) -> None:
+        curve = curves.setdefault(key, _Curve(title=title, x_name=x_name, y_name=y_name, xs=list(xs)))
+        curve.series[series] = list(ys)
 
-    def _log_pooled(self, log_dict: dict, split: str, metric):
-        """Generic per-lead-time plotting for any metric exposing
+    def _add_csi(self, curves: dict, split: str, series: str, metric: CriticalSuccessIndex):
+        all_csi = metric._compute(reduce_mean=False)  # [threshold, T]
+        lead_times = list(range(1, all_csi.shape[1] + 1))
+
+        # Mean CSI (over thresholds) vs lead time
+        self._add(curves, f"{split}/CSI_mean", series, "CSI-m", "Lead Time", "CSI",
+                  lead_times, all_csi.mean(dim=0).cpu().tolist())
+
+        # Per-threshold CSI vs lead time
+        for i, label in enumerate(metric.padded_names):
+            self._add(curves, f"{split}/CSI/{label}", series, f"CSI-{label}", "Lead Time", "CSI",
+                      lead_times, all_csi[i].cpu().tolist())
+
+        # CSI averaged over time vs threshold
+        self._add(curves, f"{split}/CSI_thresholds", series, "CSI per Threshold", "Threshold", "CSI",
+                  [str(t) for t in metric.padded_names], all_csi.mean(dim=1).cpu().tolist())
+
+    def _add_pooled(self, curves: dict, split: str, series: str, metric):
+        """Generic per-lead-time curves for any metric exposing
         `full() -> dict[str, Tensor]` of 1D `[T]` or 2D `[K, T]` tensors --
-        mirrors `_log_csi`'s three plot shapes for the 2D (threshold-like `K`)
+        mirrors `_add_csi`'s three curve shapes for the 2D (threshold-like `K`)
         case, or a single per-lead-time line for the 1D case (e.g. CRPS,
         MAE, MSE)."""
         for name, tensor in metric.full().items():
+            lead_times = list(range(1, tensor.shape[-1] + 1))
             if tensor.ndim == 1:
-                x_values = list(range(1, tensor.shape[0] + 1))
-                y_values = tensor.cpu().tolist()
-                table = wandb.Table(
-                    data=[[x, y] for x, y in zip(x_values, y_values)],
-                    columns=["Lead Time", name],
-                )
-                log_dict[f"{split}/{name}"] = wandb.plot.line(
-                    table, "Lead Time", name, title=name
-                )
+                self._add(curves, f"{split}/{name}", series, name, "Lead Time", name,
+                          lead_times, tensor.cpu().tolist())
                 continue
 
             labels = getattr(metric, "labels", None) or [str(i) for i in range(tensor.shape[0])]
 
-            mean_over_k = tensor.mean(dim=0)
-            x_values = list(range(1, mean_over_k.shape[0] + 1))
-            y_values = mean_over_k.cpu().tolist()
-            table_mean = wandb.Table(
-                data=[[x, y] for x, y in zip(x_values, y_values)],
-                columns=["Lead Time", name],
-            )
-            log_dict[f"{split}/{name}_mean"] = wandb.plot.line(
-                table_mean, "Lead Time", name, title=f"{name}-m"
-            )
-
+            self._add(curves, f"{split}/{name}_mean", series, f"{name}-m", "Lead Time", name,
+                      lead_times, tensor.mean(dim=0).cpu().tolist())
             for i, label in enumerate(labels):
-                y_values = tensor[i].cpu().tolist()
-                x_values = list(range(1, len(y_values) + 1))
-                table = wandb.Table(
-                    data=[[x, y] for x, y in zip(x_values, y_values)],
-                    columns=["Lead Time", name],
-                )
-                log_dict[f"{split}/{name}/{label}"] = wandb.plot.line(
-                    table, "Lead Time", name, title=f"{name}-{label}"
-                )
+                self._add(curves, f"{split}/{name}/{label}", series, f"{name}-{label}", "Lead Time", name,
+                          lead_times, tensor[i].cpu().tolist())
+            self._add(curves, f"{split}/{name}_thresholds", series, f"{name} per Threshold", "Threshold", name,
+                      labels, tensor.mean(dim=1).cpu().tolist())
 
-            avg_values = [tensor[i].mean().item() for i in range(tensor.shape[0])]
-            table_k = wandb.Table(
-                data=[[lab, v] for lab, v in zip(labels, avg_values)],
-                columns=["Threshold", name],
-            )
-            log_dict[f"{split}/{name}_thresholds"] = wandb.plot.line(
-                table_k, "Threshold", name, title=f"{name} per Threshold"
-            )
-
-    def _log_reliability_table(self, log_dict: dict, split: str, metric: ReliabilityAccumulator):
+    def _log_reliability_table(self, log_dict: dict, prefix: str, metric: ReliabilityAccumulator):
         table = wandb.Table(
             columns=["bucket_dbz", "lead_time", "bin", "mean_pred", "obs_freq", "count"],
             data=metric.full_table(),
         )
-        # Not "{split}/reliability": the module's `log_dict(metrics)` already logs
+        # Not "{prefix}/reliability": the module's `log_dict(metrics)` already logs
         # the scalar (ECE) under that key, and W&B can't chart a key holding
         # both a scalar and a Table.
-        log_dict[f"{split}/reliability_table"] = table
+        log_dict[f"{prefix}/reliability_table"] = table
+
+
+def _numeric(labels: list) -> list:
+    """Threshold labels ("20", "05", "5dBZ") -> numbers, so a multi-line chart
+    gets a real x axis; falls back to positions for anything unparsable."""
+    try:
+        return [float(str(x).removesuffix("dBZ")) for x in labels]
+    except ValueError:
+        return list(range(len(labels)))
