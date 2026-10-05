@@ -22,7 +22,19 @@ from rainpro.network.rainpro8 import RainPro, StackTimeAndChannels
 # (CSI/FSS/FBI/POD/FAR), invariant under the monotonic dBZ<->mm/h transform,
 # so the *choice* of evaluation intensities is what's preserved, not the
 # literal paper values.
-CSI_THRESHOLDS_DBZ = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0]
+#
+# Every threshold MUST be a `taiwan_dbz_buckets` edge. The model's binary
+# forecast (`Threshold`) can only take bucket minima, so at a non-edge
+# threshold such as 35 it must forecast the 37 bucket to count, and truth in
+# [35, 37) is a guaranteed miss even for a perfect model (perfect-oracle CSI
+# @30/35/45 was 0.95/0.87/0.82 with the old [20, 25, 30, 35, 40, 45]). The
+# continuous baselines (optical flow, persistence) carry no such handicap.
+# 31/34/46 replace 30/35/45, so scores from runs before this change are not
+# comparable at those three thresholds.
+CSI_THRESHOLDS_DBZ = [20.0, 25.0, 31.0, 34.0, 40.0, 46.0]
+assert set(CSI_THRESHOLDS_DBZ) <= {b.min for b in taiwan_dbz_buckets()}, (
+    "CSI_THRESHOLDS_DBZ must be bucket edges, see the comment above"
+)
 
 OPTFLOW_STATE_PREFIX = "test_optflow_metrics."
 

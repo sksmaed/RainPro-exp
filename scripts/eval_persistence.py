@@ -11,7 +11,8 @@ the LightningModule logs, with the same NaN-target masking:
 
   * CSI, FSS (every window), POD / FAR / FBI -- deterministic. The model side
     uses `EvalOutputs.forecast` (the 0.5-threshold pick, values are bucket
-    minima, so "forecast >= 35" means the 37 dBZ bucket or above).
+    minima). `CSI_THRESHOLDS_DBZ` are bucket edges, so "forecast >= 34" means
+    exactly the 34 dBZ bucket or above -- no threshold falls inside a bucket.
   * CRPS, Brier -- probabilistic. Persistence and optical flow enter as step
     CDFs (all mass on their own value), so these compare the model's full
     distribution with deterministic baselines on the same footing. Where the 0.5 forecast
@@ -218,9 +219,9 @@ def main() -> None:
     lookup = {(r["source"], r["metric"], r["threshold"], r["window"], r["lead_min"]): r["value"] for r in rows}
     fss_window = str(group["fss"].windows[-1])
     columns = [  # (label, metric, threshold, window)
-        ("CSI20", "CSI", 20.0, ""), ("CSI30", "CSI", 30.0, ""), ("CSI35", "CSI", 35.0, ""),
+        ("CSI20", "CSI", 20.0, ""), ("CSI31", "CSI", 31.0, ""), ("CSI34", "CSI", 34.0, ""),
         (f"FSS20w{fss_window}", "FSS", 20.0, fss_window), ("FBI20", "FBI", 20.0, ""),
-        ("FBI35", "FBI", 35.0, ""), ("POD35", "POD", 35.0, ""), ("CRPS", "CRPS", "", ""),
+        ("FBI34", "FBI", 34.0, ""), ("POD34", "POD", 34.0, ""), ("CRPS", "CRPS", "", ""),
     ]
     sources = list(metrics)
     print("\n" + " / ".join(sources))

@@ -41,7 +41,7 @@ A 的 `include_satellite=False` 為什麼不影響 `radar_8km`（兩者共用同
 
 | 指標 | 為什麼要它 | 狀態 |
 | --- | --- | --- |
-| CSI @ [20, 25, 30, 35, 40, 45] dBZ | 主指標。門檻二值化，直觀、業界慣用 | 已有（`rainpro/metrics/csi.py`） |
+| CSI @ [20, 25, 31, 34, 40, 46] dBZ（須為 bucket 邊界，見 implementation notes） | 主指標。門檻二值化，直觀、業界慣用 | 已有（`rainpro/metrics/csi.py`） |
 | FSS（鄰域 1/2/4/8 格） | 容忍位移。CSI 會把「對但偏一格」當全錯，加了 NWP 之後場位移常見，只看 CSI 會誤判 | 已建（`rainpro/metrics/fss.py`，**TW 版新增**） |
 | CRPS | 機率品質，論文消融表的主指標。模型輸出是 bucket 化的累積機率，只看 CSI 等於把機率丟掉 | 已建（`rainpro/metrics/probabilistic.py`，**TW 版新增**） |
 | Brier / reliability diagram | 機率校準：「說 70% 的格點是不是真的 70% 下雨」 | 已建（同上，`BrierScore`/`ReliabilityAccumulator`，**TW 版新增**） |

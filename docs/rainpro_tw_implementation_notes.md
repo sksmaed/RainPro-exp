@@ -32,6 +32,12 @@
 
 Tail 假設（codebase 其他地方都沒寫，這裡明確講）：低於第一個 bucket 邊界視為 F=0，高於最後一個視為 F=1。
 
+### CSI 門檻必須是 bucket 邊界
+
+模型的確定性預報（`Threshold`）只能輸出 bucket 下界（0, 5, …, 25, 28, 31, 34, 37, …）。門檻若落在 bucket 內部（例如 35 落在 [34, 37)），模型必須預報到 37 那一格才算命中，真值落在 [35, 37) 的像素對模型是**必然漏報**，FBI/POD 也被往下拉；連續值輸出的光流與 persistence 則沒有這個限制，比較對模型系統性不利。用 `Threshold` + `CriticalSuccessIndex` 對「每個像素都給對 bucket」的完美模型打分（18–50 dBZ 均勻分布），舊門檻 `[20, 25, 30, 35, 40, 45]` 的 CSI@30/35/45 只有 0.951/0.871/0.818，其餘為 1.000；真實分布高強度端更稀少，影響更大。
+
+因此改用 bucket 邊界 `[20, 25, 31, 34, 40, 46]`（不需重新訓練），`rainpro/modules/rainpro8.py` 有 assert 防止再放進非邊界值。`--thresholds` 的最佳化本來就以 bucket 邊界計算，與此一致。**改動前的 run 在 30/35/45 的 CSI/FSS/FBI/POD/FAR 不能和改動後的 31/34/46 直接比較**，需重跑 test。若之後要以 30/35/45 報告，應把這些值加進 `taiwan_dbz_buckets`（需重新訓練）。
+
 ### FSS 視窗定義與 NaN 遮罩
 
 - FSS 的「1/2/4/8 格」鄰域，實作為正方形視窗邊長（N×N），不是半徑。
@@ -62,7 +68,7 @@ Tail 假設（codebase 其他地方都沒寫，這裡明確講）：低於第一
 |---|---|---|
 | 1 | `rainpro/data/rainpro8_dataset.py` | 移除 target 的 `dbz_to_mmh` 呼叫；target 保持原始 dBZ |
 | 2 | `rainpro/loss/ordinal_consistent.py` | `taiwan_buckets` → `taiwan_dbz_buckets`，邊界改為 `[5, 10, 15, 20, 25, 28, 31, 34, 37, 40, 43, 46, 49, 52, 55, 60]`（5 dB 間隔到 25 dBZ，3 dB 間隔到 55 dBZ，60 dBZ 封頂；未用 training set 分位數決定，先用手訂邊界） |
-| 3 | `rainpro/modules/rainpro8.py` | `CSI_THRESHOLDS_MMH` → `CSI_THRESHOLDS_DBZ = [20, 25, 30, 35, 40, 45]` |
+| 3 | `rainpro/modules/rainpro8.py` | `CSI_THRESHOLDS_MMH` → `CSI_THRESHOLDS_DBZ`，最初為 `[20, 25, 30, 35, 40, 45]`，後改為 `[20, 25, 31, 34, 40, 46]`（見下方「CSI 門檻必須是 bucket 邊界」） |
 | 4 | `rainpro/data/marshall_palmer.py` | 不變，但移出資料路徑，改供 post-hoc 標記使用（例：`rainpro/metrics/probabilistic.py` 的 CRPS mm/h 積分權重） |
 
 架構、`out_channels`、loss 形式、`OptimalThresholds` 流程皆不變（`taiwan_dbz_buckets` 一樣是 16 個 bucket 的清單，只是換了名字跟數值）。
