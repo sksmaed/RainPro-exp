@@ -36,6 +36,18 @@ target grid's lat/lon) for building a static mask later.
 ">=" matches the loss's `Bucketize(right=True)` (a target of exactly t counts
 as exceeding t). Writes a per-sample CSV and a summary figure.
 
+Presentation figures (audience-facing, `--lang zh` by default), counted per
+10-minute frame -- each frame once, not repeated across the 36 overlapping
+samples that contain it:
+  <out stem>_coverage.png      how much of the canvas reaches >= 20 / >= 35 dBZ,
+                               across all training frames, in readable bins.
+  <out stem>_mean_dbz.png      histogram of each training frame's canvas-mean
+                               reflectivity (no echo counted as 0 dBZ).
+  <out stem>_train_vs_val.png  share of grid cells >= 20 / 35 / 45 dBZ per
+                               split, and >= 35 dBZ coverage by month (needs
+                               val in --splits; test is drawn too when present).
+Titles only name what is plotted; they state no findings.
+
 Usage (CPU, no checkpoint; reads every 2021 QPESUMS frame once):
     python scripts/inspect_echo_stats.py --config rainpro8.yml \\
         --data-root '{"qpesums": "...", "sta_h8": "...Q1.zarr,...Q2.zarr,..."}' \\
@@ -73,6 +85,8 @@ from rainpro.data.rainpro8_dataset import (  # noqa: E402
 from rainpro.data.regrid import target_grid  # noqa: E402
 from rainpro.loss.ordinal_consistent import taiwan_dbz_buckets  # noqa: E402
 
+from plot_bucket_distribution import setup_font  # noqa: E402  (same scripts/ directory)
+
 EDGES = [b.min for b in taiwan_dbz_buckets()]
 # Report thresholds; must be a subset of COUNT_AT (which is what gets counted).
 REPORT = (5.0, 20.0, 30.0, 35.0, 40.0, 45.0)
@@ -109,6 +123,7 @@ def frame_stats(dm: RainPro8DataModule, positions: np.ndarray, dry_frac: float, 
     valid = np.zeros(len(positions), dtype=np.int64)
     counts = np.zeros((len(positions), len(COUNT_AT)), dtype=np.int64)
     vmax = np.full(len(positions), np.nan, dtype=np.float32)
+    vmean = np.full(len(positions), np.nan, dtype=np.float32)  # grid mean, no echo counted as 0 dBZ
     maps = {k: np.zeros(mapping.dst_shape, dtype=np.int64)
             for k in ("valid", "ge35", "ge45", "dry_valid", "dry_ge35")}
     n_dry = 0
@@ -125,6 +140,7 @@ def frame_stats(dm: RainPro8DataModule, positions: np.ndarray, dry_frac: float, 
                 continue
             counts[i + j] = (vals[:, None] >= thresholds[None, :]).sum(axis=0)
             vmax[i + j] = vals.max()
+            vmean[i + j] = vals.mean()
             with np.errstate(invalid="ignore"):  # NaN >= t is False, as wanted
                 ge35, ge45 = field >= 35.0, field >= 45.0
             maps["valid"] += finite
@@ -137,7 +153,7 @@ def frame_stats(dm: RainPro8DataModule, positions: np.ndarray, dry_frac: float, 
         print(f"  frames {min(i + block, len(positions))}/{len(positions)}", flush=True)
     maps["n_frames"], maps["n_dry"] = len(positions), n_dry
     maps["lat"], maps["lon"] = target_grid(dm.center_lat, dm.center_lon, spec.size_km, spec.resolution_km)
-    return valid, counts, vmax, maps
+    return valid, counts, vmax, vmean, maps
 
 
 def clutter_report(maps: dict, out_png: str, top_n: int, npz: str | None) -> None:
@@ -200,6 +216,180 @@ def clutter_report(maps: dict, out_png: str, top_n: int, npz: str | None) -> Non
     print(f"wrote {out_png}")
 
 
+# --- presentation figures ---------------------------------------------------
+# Reference palette (light): categorical slots 1-3 validated all-pairs; aqua is
+# below 3:1 on the surface, so every bar carries a direct value label.
+SPLIT_COLOR = {"train": "#2a78d6", "val": "#eb6834", "test": "#1baf7a"}
+SURFACE, INK, INK_2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
+COVER_BINS = [(0, 0), (0, 1e-4), (1e-4, 1e-3), (1e-3, 1e-2), (1e-2, 5e-2), (5e-2, 0.2), (0.2, 1.0 + 1e-9)]
+TEXT = {
+    "zh": {
+        "split": {"train": "訓練集", "val": "驗證集", "test": "測試集"},
+        "cover_labels": ["0", "<0.01%", "0.01–0.1%", "0.1–1%", "1–5%", "5–20%", "≥20%"],
+        "cover_x": "回波覆蓋率（畫面中達到門檻的網格比例）",
+        "cover_y": "frame 比例（%）",
+        "cover_title": "≥{t:g} dBZ",
+        "cover_sup": "訓練資料的回波覆蓋率分布",
+        "frames_note": "訓練集 {n:,} 個 frame（每 10 分鐘一張，512 × 512 km）",
+        "mean_x": "frame 的全畫面平均回波（dBZ，無回波格點以 0 計）",
+        "mean_y": "frame 比例（%）",
+        "mean_title": "訓練資料每個 frame 的全畫面平均回波",
+        "median": "中位數",
+        "share_title": "≥{t:g} dBZ",
+        "share_y": "達到門檻的網格比例（%）",
+        "month_title": "逐月 ≥35 dBZ 覆蓋率",
+        "month_x": "月份",
+        "month_y": "平均覆蓋率（%）",
+        "vs_sup": "訓練集、驗證集與測試集的回波分布",
+        "vs_note": "frame 數：{counts}（每 10 分鐘一張；比例以網格計）",
+    },
+    "en": {
+        "split": {"train": "train", "val": "validation", "test": "test"},
+        "cover_labels": ["0", "<0.01%", "0.01–0.1%", "0.1–1%", "1–5%", "5–20%", "≥20%"],
+        "cover_x": "echo coverage (share of the canvas at or above the threshold)",
+        "cover_y": "share of frames (%)",
+        "cover_title": "≥{t:g} dBZ",
+        "cover_sup": "Echo coverage of the training frames",
+        "frames_note": "{n:,} training frames (one every 10 min, 512 × 512 km)",
+        "mean_x": "canvas-mean reflectivity of a frame (dBZ, no echo counted as 0)",
+        "mean_y": "share of frames (%)",
+        "mean_title": "Canvas-mean reflectivity per training frame",
+        "median": "median",
+        "share_title": "≥{t:g} dBZ",
+        "share_y": "share of grid cells (%)",
+        "month_title": "Monthly coverage ≥35 dBZ",
+        "month_x": "month",
+        "month_y": "mean coverage (%)",
+        "vs_sup": "Echo distribution of the train, validation and test splits",
+        "vs_note": "frames: {counts} (one every 10 min; shares are per grid cell)",
+    },
+}
+
+
+def _style(ax, grid_axis="y") -> None:
+    ax.set_facecolor(SURFACE)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(AXIS)
+    ax.tick_params(colors=INK_2, labelsize=11, length=0)
+    ax.grid(axis=grid_axis, color=GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+
+
+def _bar_labels(ax, bars, values, fmt) -> None:
+    """Value on top of each bar; empty bars stay unlabeled (a row of '0.0%'
+    is noise, and the missing bar already says zero)."""
+    for bar, v in zip(bars, values):
+        if v == 0:
+            continue
+        ax.annotate(fmt(v), (bar.get_x() + bar.get_width() / 2, bar.get_height()), xytext=(0, 3),
+                    textcoords="offset points", ha="center", va="bottom", fontsize=11, color=INK_2)
+
+
+def presentation_figures(stem: str, ext: str, lang: str, frames: dict, frame_times: pd.DatetimeIndex) -> None:
+    """Three audience-facing figures. `frames[split]` = indices into the
+    per-frame arrays (f20, f35, f45, mean_dbz, valid, ge20/35/45 counts) of
+    the frames that split's targets use; each frame counted once."""
+    text = TEXT[lang]
+    fig_kw = dict(layout="constrained", facecolor=SURFACE)
+
+    # 1. coverage distribution of training frames
+    tr = frames["train"]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.2), sharey=True, **fig_kw)
+    for ax, t in zip(axes, (20.0, 35.0)):
+        cover = tr[f"f{t:g}"]
+        shares = [np.mean(cover == 0) if hi == 0 else np.mean((cover > 0) & (cover >= lo) & (cover < hi))
+                  for lo, hi in COVER_BINS]
+        shares = [100 * x for x in shares]
+        bars = ax.bar(range(len(shares)), shares, width=0.72, color=SPLIT_COLOR["train"],
+                      edgecolor=SURFACE, linewidth=2)
+        _bar_labels(ax, bars, shares, lambda v: f"{v:.1f}%")
+        _style(ax)
+        ax.set_xticks(range(len(shares)), text["cover_labels"])
+        ax.set_xlabel(text["cover_x"], fontsize=12, color=INK_2)
+        ax.set_title(text["cover_title"].format(t=t),
+                     fontsize=14, color=INK, loc="left")
+    axes[0].set_ylabel(text["cover_y"], fontsize=12, color=INK_2)
+    axes[0].set_ylim(0, max(b.get_height() for ax in axes for b in ax.patches) * 1.15)
+    fig.suptitle(text["cover_sup"], fontsize=16, color=INK, x=0.01, ha="left")
+    fig.supxlabel(text["frames_note"].format(n=len(tr["f20"])), fontsize=10, color=MUTED, x=0.99, ha="right")
+    _save(fig, f"{stem}_coverage{ext}")
+
+    # 2. canvas-mean dBZ per frame
+    mean = tr["mean_dbz"][np.isfinite(tr["mean_dbz"])]
+    fig, ax = plt.subplots(figsize=(11, 5), **fig_kw)
+    # ~30 bins over the observed range, on a round step so bin edges read cleanly
+    step = next(w for w in (0.1, 0.2, 0.25, 0.5, 1.0, 2.0) if mean.max() / w <= 40)
+    edges = np.arange(0, np.ceil(mean.max() / step) * step + step, step)
+    counts_, _ = np.histogram(mean, bins=edges)
+    heights = 100 * counts_ / len(mean)
+    ax.bar(edges[:-1], heights, width=step, align="edge", color=SPLIT_COLOR["train"],
+           edgecolor=SURFACE, linewidth=1.5)
+    med = float(np.median(mean))
+    top = heights.max() * 1.18
+    ax.set_ylim(0, top)
+    ax.axvline(med, color=INK_2, linewidth=1.5, linestyle="--")
+    ax.annotate(f"{text['median']} {med:.1f} dBZ", (med, top), xytext=(6, -4), textcoords="offset points",
+                fontsize=11, color=INK, va="top",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor=SURFACE, edgecolor="none"))
+    _style(ax)
+    ax.set_xlabel(text["mean_x"], fontsize=12, color=INK_2)
+    ax.set_ylabel(text["mean_y"], fontsize=12, color=INK_2)
+    ax.set_title(text["mean_title"], fontsize=15, color=INK, loc="left")
+    fig.supxlabel(text["frames_note"].format(n=len(mean)), fontsize=10, color=MUTED, x=0.99, ha="right")
+    _save(fig, f"{stem}_mean_dbz{ext}")
+
+    # 3. train vs val (vs test)
+    if "val" not in frames:
+        print("!! no val split requested -- skipping the train-vs-val figure (add val to --splits)")
+        return
+    splits = [s for s in ("train", "val", "test") if s in frames]
+    share = {s: {t: frames[s][f"ge{t:g}"].sum() / frames[s]["valid"].sum() for t in (20.0, 35.0, 45.0)}
+             for s in splits}
+    fig = plt.figure(figsize=(14, 9), **fig_kw)
+    grid = fig.add_gridspec(2, 3, height_ratios=[1, 1.15])
+    for c, t in enumerate((20.0, 35.0, 45.0)):
+        ax = fig.add_subplot(grid[0, c])
+        vals = [100 * share[s][t] for s in splits]
+        bars = ax.bar(range(len(splits)), vals, width=0.62, color=[SPLIT_COLOR[s] for s in splits],
+                      edgecolor=SURFACE, linewidth=2)
+        _bar_labels(ax, bars, vals, lambda v: f"{v:.2g}%")
+        _style(ax)
+        ax.set_xticks(range(len(splits)), [text["split"][s] for s in splits], fontsize=12)
+        ax.set_ylim(0, max(vals) * 1.2)
+        ax.set_title(text["share_title"].format(t=t), fontsize=14, color=INK, loc="left")
+        if c == 0:
+            ax.set_ylabel(text["share_y"], fontsize=12, color=INK_2)
+
+    ax = fig.add_subplot(grid[1, :])
+    monthly = {}
+    for s in splits:
+        months = frame_times[frames[s]["index"]].month
+        monthly[s] = pd.Series(frames[s]["f35"]).groupby(months).mean() * 100
+        ax.plot(monthly[s].index, monthly[s].values, color=SPLIT_COLOR[s], linewidth=2, marker="o",
+                markersize=8, markeredgecolor=SURFACE, markeredgewidth=2, label=text["split"][s])
+    _style(ax)
+    ax.set_xticks(range(1, 13))
+    ax.set_xlim(0.5, 12.5)
+    ax.set_ylim(0, None)
+    ax.set_xlabel(text["month_x"], fontsize=12, color=INK_2)
+    ax.set_ylabel(text["month_y"], fontsize=12, color=INK_2)
+    ax.set_title(text["month_title"], fontsize=14, color=INK, loc="left")
+    ax.legend(frameon=False, fontsize=12, loc="upper left")
+    fig.suptitle(text["vs_sup"], fontsize=16, color=INK, x=0.01, ha="left")
+    counts_txt = ", ".join(f"{text['split'][s]} {len(frames[s]['f35']):,}" for s in splits)
+    fig.supxlabel(text["vs_note"].format(counts=counts_txt), fontsize=10, color=MUTED, x=0.99, ha="right")
+    _save(fig, f"{stem}_train_vs_val{ext}")
+
+
+def _save(fig, path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+    print(f"wrote {path}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True, help="rainpro8.yml or a run's saved config.yml")
@@ -215,6 +405,8 @@ def main() -> None:
                      help="a frame is 'dry' when this fraction of the canvas or less is >= 20 dBZ")
     ap.add_argument("--top-n", type=int, default=20, help="hotspots to list / circle")
     ap.add_argument("--clutter-npz", default=None, help="optional: save the per-pixel maps")
+    ap.add_argument("--lang", default="zh", choices=("zh", "en"), help="labels of the presentation figures")
+    ap.add_argument("--font", default=None, help="font file with CJK glyphs, if none is installed")
     args = ap.parse_args()
 
     dm = load_datamodule(args)
@@ -237,7 +429,7 @@ def main() -> None:
 
     unique = np.unique(np.concatenate([p[p >= 0] for p in sample_pos.values()]))
     print(f"reading {len(unique)} unique QPESUMS frames ...", flush=True)
-    valid_u, counts_u, max_u, maps = frame_stats(dm, unique, args.dry_frac)
+    valid_u, counts_u, max_u, mean_u, maps = frame_stats(dm, unique, args.dry_frac)
 
     rep_idx = [COUNT_AT.index(t) for t in REPORT]
     edge_idx = [COUNT_AT.index(t) for t in EDGES]
@@ -337,7 +529,25 @@ def main() -> None:
     print(f"wrote {args.out}")
 
     stem, ext = os.path.splitext(args.out)
-    clutter_report(maps, f"{stem}_clutter{ext or '.png'}", args.top_n, args.clutter_npz)
+    ext = ext or ".png"
+    clutter_report(maps, f"{stem}_clutter{ext}", args.top_n, args.clutter_npz)
+
+    # Presentation figures work per FRAME (each 10-min frame once), not per
+    # sample (where every frame is repeated across 36 overlapping samples).
+    frames = {}
+    for split in splits:
+        pos = sample_pos[split]
+        idx = np.unique(np.searchsorted(unique, pos[pos >= 0]))
+        idx = idx[valid_u[idx] > 0]
+        frames[split] = {"index": idx, "valid": valid_u[idx], "mean_dbz": mean_u[idx]}
+        for t in (20.0, 35.0, 45.0):
+            frames[split][f"ge{t:g}"] = counts_u[idx, COUNT_AT.index(t)]
+            frames[split][f"f{t:g}"] = counts_u[idx, COUNT_AT.index(t)] / valid_u[idx]
+    if "train" in frames:
+        lang = setup_font(args.lang, args.font)
+        presentation_figures(stem, ext, lang, frames, time_index[unique])
+    else:
+        print("!! presentation figures need the train split in --splits")
 
 
 if __name__ == "__main__":
