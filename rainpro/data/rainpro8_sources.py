@@ -143,6 +143,12 @@ class SourceSpec:
     # `QPESUMS_NO_ECHO_VALUES` above for why -99 is this and not missing.
     no_echo_values: Sequence[float] = ()
     no_echo_fill: float = 0.0
+    # How the source's native grid is resampled onto this spec's canvas:
+    # "nearest" takes the one source pixel nearest each cell centre (original
+    # behaviour -- at 4 km that reads ~1 of 9 QPESUMS pixels, at 8 km ~1 of
+    # 36); "mean" / "zmean" average every source pixel inside the cell (zmean
+    # in linear reflectivity, for dBZ); see `rainpro.data.regrid.aggregate`.
+    downsample: str = "nearest"
 
     @property
     def size_px(self) -> int:
@@ -157,11 +163,16 @@ class SourceSpec:
         return len(self.variables) + len(self.variables_3d) * len(self.levels)
 
 
+DOWNSAMPLE_METHODS = ("nearest", "mean", "zmean")
+
+
 def build_taiwan_sources(
     include_satellite: bool = True,
     include_gfs: bool = False,
     gfs_variables: Sequence[str] = GFS_ANALYSIS_VARIABLES,
     gfs_forecast_variables: Sequence[str] = ("PRATE",),
+    radar_downsample: str = "nearest",
+    satellite_downsample: str = "nearest",
 ) -> dict[str, SourceSpec]:
     """Build the Taiwan RainPro-8 source spec dict, keyed like the model's `sources`.
 
@@ -192,6 +203,14 @@ def build_taiwan_sources(
     which is also hourly). If a finer-grained STA_H8 source is later wired in,
     revert this to the 10-minute window.
     """
+    for name, method in (("radar_downsample", radar_downsample), ("satellite_downsample", satellite_downsample)):
+        if method not in DOWNSAMPLE_METHODS:
+            raise ValueError(f"{name} must be one of {DOWNSAMPLE_METHODS}, got {method!r}")
+
+    # `target_2km` always stays "nearest": the target defines the forecast task,
+    # and averaging it would change what is being predicted, not just how the
+    # input is read. `radar_downsample` / `satellite_downsample` apply to the
+    # input tiers only.
     sources: dict[str, SourceSpec] = {
         "target_2km": SourceSpec(
             name="target_2km",
@@ -212,6 +231,7 @@ def build_taiwan_sources(
             variables=("max_dbz",),
             missing_values=QPESUMS_MISSING_VALUES,
             no_echo_values=QPESUMS_NO_ECHO_VALUES,
+            downsample=radar_downsample,
         ),
         "radar_8km": SourceSpec(
             name="radar_8km",
@@ -222,6 +242,7 @@ def build_taiwan_sources(
             variables=("max_dbz",),
             missing_values=QPESUMS_MISSING_VALUES,
             no_echo_values=QPESUMS_NO_ECHO_VALUES,
+            downsample=radar_downsample,
         ),
     }
 
@@ -233,6 +254,7 @@ def build_taiwan_sources(
             size_km=1536,
             offsets_min=(-120, -60),  # -120, -60 min @ hourly, 2 steps (see docstring)
             variables=tuple(STA_H8_BANDS),
+            downsample=satellite_downsample,
         )
 
     if include_gfs:

@@ -75,7 +75,11 @@ model:
     # Set false if torch.compile misbehaves on your PyTorch/GPU combination --
     # checkpoints are compatible either way.
     compile_model: true
-    lead_time_decay_ratio: 10.0
+    # First-to-last lead-time loss weight ratio (weights decay exponentially
+    # and average 1). 10 (the paper's RainPro-8 value) put +10 min at 2.53 and
+    # +6 h at 0.25 -- 10x less say for long leads; 2 (OrdinalConsistentLoss's
+    # own default) gives 1.38 -> 0.69.
+    lead_time_decay_ratio: 2.0
     learning_rate: 3.0e-4
     weight_decay: 0.1
     dropout: 0.1
@@ -99,6 +103,17 @@ data:
   # rather than training on all-fill_value satellite input).
   start_date: 2021-01-01
   end_date: 2022-01-01
+  # Cross-validation. With `sample_manifest` set (scripts/build_sample_pool.py
+  # -> scripts/make_cv_folds.py), splits come from it and start/end_date and
+  # cycle_* below are ignored: fold `cv_fold` is val, the "test" partition is
+  # test, the other folds train. `cv_gap_hours` is kept between roles (train
+  # gives way to val/test, val to test); `train_low_echo_filter` applies the
+  # manifest's `keep` column to train only -- val/test always use every sample.
+  # Set both on the CLI per run: --data.sample_manifest <csv> --data.cv_fold k
+  sample_manifest: null
+  cv_fold: 0
+  cv_gap_hours: 12
+  train_low_echo_filter: true
   # 17:1:2 day cycle == 85/5/10 train/val/test, repeated through the year so
   # no single split is skewed toward one season (paper Sec. A.3 rationale).
   cycle_train_days: 17
@@ -107,6 +122,14 @@ data:
   cycle_blackout_hours: 12
   center_lat: 23.7
   center_lon: 121.0
+  # Input-tier resampling (target_2km always stays nearest-neighbour): average
+  # every native pixel inside each 4 / 8 km cell instead of reading the one
+  # nearest its centre (~1 of 9 QPESUMS pixels at 4 km, ~1 of 36 at 8 km).
+  # Radar averages in linear Z ("zmean"), since dBZ is logarithmic; satellite
+  # brightness temperature is linear ("mean"). "nearest" reproduces runs
+  # from before this option.
+  radar_downsample: zmean
+  satellite_downsample: mean
   # 0 = clean control run. The paper's +/-256 km assumes a source domain much
   # larger than the canvas; QPESUMS is ~565x780 km with the 512 km target
   # nearly touching its east edge, so +/-256 km put ~26% of each training

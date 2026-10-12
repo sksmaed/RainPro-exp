@@ -130,6 +130,87 @@ def sta_h8_availability(path: str) -> pd.Series:
     return pd.Series(valid, index=pd.DatetimeIndex(times), dtype=bool)
 
 
+def manifest_splits(
+    manifest_path: str,
+    cv_fold: int,
+    gap_hours: float = 12.0,
+    train_low_echo_filter: bool = True,
+) -> tuple[dict[str, list[pd.Timestamp]], dict[str, dict[str, int]]]:
+    """train / val / test init times from a CV manifest
+    (`scripts/make_cv_folds.py`): `partition` "fold<cv_fold>" is val,
+    "test" is test, every other fold is train.
+
+    Gap: roles are ranked test > val > train, and a sample is dropped when a
+    sample of a higher-ranked role lies within `gap_hours` of it. That
+    guarantees >= `gap_hours` between any two kept samples of different roles
+    -- exactly, including across missing timesteps (a symmetric gap_hours / 2
+    trim on each side does not) -- and wider than one sample's data window
+    (-2 h satellite input .. +6 h target). Only the lower-ranked side pays,
+    so val and test stay complete. It depends on which fold is val, so
+    boundaries between two train folds cost nothing.
+
+    Low-echo filter: with `train_low_echo_filter`, train keeps only rows with
+    `keep` true. Val and test are never filtered -- they must be scored on the
+    real mix of weather.
+
+    Returns (splits, counts) -- counts per role: in pool / dropped by gap /
+    dropped by the low-echo filter / used.
+    """
+    df = pd.read_csv(manifest_path, parse_dates=["init_time"])
+    missing = {"init_time", "partition", "keep"} - set(df.columns)
+    if missing:
+        raise ValueError(f"{manifest_path}: missing columns {sorted(missing)} -- build it with "
+                         "scripts/build_sample_pool.py then scripts/make_cv_folds.py")
+    val_name = f"fold{cv_fold}"
+    if val_name not in set(df["partition"]):
+        raise ValueError(f"cv_fold={cv_fold}: no partition {val_name!r} in {manifest_path} "
+                         f"(has {sorted(set(df['partition']))})")
+
+    role = np.where(df["partition"] == "test", "test", np.where(df["partition"] == val_name, "val", "train"))
+    times = df["init_time"].to_numpy(dtype="datetime64[m]")
+    gap = np.timedelta64(int(round(gap_hours * 60)), "m")
+    rank = {"train": 0, "val": 1, "test": 2}
+    clear = np.ones(len(df), dtype=bool)
+    for r in ("train", "val"):
+        mine = role == r
+        higher = np.sort(times[np.isin(role, [q for q in rank if rank[q] > rank[r]])])
+        if not mine.any() or not len(higher):
+            continue
+        idx = np.searchsorted(higher, times[mine])
+        prev = higher[np.clip(idx - 1, 0, len(higher) - 1)]
+        nxt = higher[np.clip(idx, 0, len(higher) - 1)]
+        nearest = np.minimum(np.abs(times[mine] - prev), np.abs(nxt - times[mine]))
+        clear[mine] = nearest >= gap
+
+    keep = df["keep"].astype(bool).to_numpy()
+    splits, counts = {}, {}
+    for r in ("train", "val", "test"):
+        mine = role == r
+        used = mine & clear & (keep if (r == "train" and train_low_echo_filter) else True)
+        splits[r] = list(pd.DatetimeIndex(df.loc[used, "init_time"]).sort_values())
+        counts[r] = {
+            "pool": int(mine.sum()),
+            "gap": int((mine & ~clear).sum()),
+            "low_echo": int((mine & clear & ~used).sum()),
+            "used": int(used.sum()),
+        }
+    return splits, counts
+
+
+def downsample_from_checkpoint(ckpt_path: str) -> dict[str, str]:
+    """`{"radar_downsample": ..., "satellite_downsample": ...}` as the
+    checkpoint's run trained with (Lightning stores the datamodule's
+    hyperparameters in the checkpoint). Checkpoints from before the option
+    existed have no such entry and were trained on "nearest" inputs. A model
+    fed inputs resampled differently from training is silently degraded, not
+    broken, so every inference path should take its setting from here."""
+    import torch
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    hparams = ckpt.get("datamodule_hyper_parameters") or {}
+    return {key: hparams.get(key, "nearest") for key in ("radar_downsample", "satellite_downsample")}
+
+
 class RainPro8DataModule(LightningDataModule):
     def __init__(
         self,
@@ -161,6 +242,20 @@ class RainPro8DataModule(LightningDataModule):
         latlon_names: dict[str, tuple[str, str]] | None = None,
         gfs_variables: tuple[str, ...] = GFS_ANALYSIS_VARIABLES,
         gfs_forecast_variables: tuple[str, ...] = ("PRATE",),
+        # "nearest" (default, what every run before this option used) | "mean"
+        # | "zmean" -- see `SourceSpec.downsample`. Recorded in the checkpoint's
+        # datamodule hyperparameters; `downsample_from_checkpoint` reads it back
+        # so inference reads inputs the way the checkpoint was trained on.
+        radar_downsample: str = "nearest",
+        satellite_downsample: str = "nearest",
+        # Cross-validation: with `sample_manifest` (a CSV from
+        # scripts/make_cv_folds.py) the splits come from it -- fold `cv_fold`
+        # is val, the "test" partition is test, the other folds train -- and
+        # start/end_date + cycle_* are ignored. See `manifest_splits`.
+        sample_manifest: str | None = None,
+        cv_fold: int = 0,
+        cv_gap_hours: float = 12.0,
+        train_low_echo_filter: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -189,12 +284,18 @@ class RainPro8DataModule(LightningDataModule):
         self.norm_bounds = norm_bounds
         self.variable_aliases = variable_aliases
         self.latlon_names = latlon_names
+        self.sample_manifest = sample_manifest
+        self.cv_fold = cv_fold
+        self.cv_gap_hours = cv_gap_hours
+        self.train_low_echo_filter = train_low_echo_filter
 
         self.sources: dict[str, SourceSpec] = build_taiwan_sources(
             include_satellite=include_satellite,
             include_gfs=include_gfs,
             gfs_variables=gfs_variables,
             gfs_forecast_variables=gfs_forecast_variables,
+            radar_downsample=radar_downsample,
+            satellite_downsample=satellite_downsample,
         )
 
         target_offsets = self.sources["target_2km"].offsets_min
@@ -214,6 +315,19 @@ class RainPro8DataModule(LightningDataModule):
         return self.sources["target_2km"].timesteps
 
     def setup(self, stage: str | None = None):
+        if self.sample_manifest:
+            # The manifest's pool was built with the same availability checks
+            # below (scripts/build_sample_pool.py runs this setup()), so they
+            # aren't repeated -- build it with the same data_root you train on.
+            self.split_times, counts = manifest_splits(
+                self.sample_manifest, self.cv_fold, self.cv_gap_hours, self.train_low_echo_filter
+            )
+            for split, c in counts.items():
+                rank_zero_info(
+                    f"[CV fold {self.cv_fold}] {split}: {c['used']:,} used of {c['pool']:,}"
+                    f" (gap -{c['gap']:,}, low-echo filter -{c['low_echo']:,})"
+                )
+            return
         # Restrict candidate init times to those actually present in the QPESUMS
         # target store; per-sample radar-coverage filtering (paper: >=50% for
         # train, allowed lower for val/test) is left to a `coverage` variable in

@@ -99,7 +99,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rainpro.baselines.optical_flow import OpticalFlowBaseline  # noqa: E402
 from rainpro.data.rainpro8_dataset import RainPro8Dataset  # noqa: E402
-from rainpro.data.rainpro8_datamodule import RainPro8DataModule  # noqa: E402
+from rainpro.data.rainpro8_datamodule import RainPro8DataModule, downsample_from_checkpoint  # noqa: E402
 from rainpro.loss.ordinal_consistent import taiwan_dbz_buckets  # noqa: E402
 from rainpro.modules.rainpro8 import RainPro8Module  # noqa: E402
 from rainpro.modules.utils import EvalRequest  # noqa: E402
@@ -391,17 +391,42 @@ def main() -> None:
     variable_aliases = json.loads(args.variable_aliases)
     init_time = np.datetime64(args.init_time)
 
-    # Built only for its `sources` / `frames_out`, which RainPro8Module needs to
-    # size the network. `setup()` is deliberately NOT called -- that scans the
-    # archives to filter split times, which inference doesn't need.
-    datamodule = RainPro8DataModule(
-        data_root=data_root,
-        start_date="2021-01-01",
-        end_date="2022-01-01",
-        include_satellite=args.include_satellite,
-        include_gfs=args.include_gfs,
-        variable_aliases=variable_aliases,
-    )
+    # Each checkpoint must see inputs resampled the way it was trained
+    # (`radar_downsample` / `satellite_downsample`, read from the checkpoint),
+    # so the datamodule -- built only for its `sources` / `frames_out`, which
+    # RainPro8Module needs to size the network; `setup()` is deliberately NOT
+    # called, it scans the archives to filter split times -- and the input
+    # batch are built per setting, once each.
+    inputs: dict[tuple, tuple[RainPro8DataModule, dict[str, torch.Tensor]]] = {}
+
+    def inputs_for(ckpt_path: str) -> tuple[RainPro8DataModule, dict[str, torch.Tensor]]:
+        settings = downsample_from_checkpoint(ckpt_path)
+        key = tuple(sorted(settings.items()))
+        if key not in inputs:
+            dm = RainPro8DataModule(
+                data_root=data_root,
+                start_date="2021-01-01",
+                end_date="2022-01-01",
+                include_satellite=args.include_satellite,
+                include_gfs=args.include_gfs,
+                variable_aliases=variable_aliases,
+                **settings,
+            )
+            ds = RainPro8Dataset(
+                data_root=data_root,
+                sources=dm.sources,
+                init_times=[init_time],
+                jitter_km=0.0,  # inference: no augmentation, canvas centred as configured
+                variable_aliases=variable_aliases,
+            )
+            print(f"building input sample for {init_time} ({', '.join(f'{k}={v}' for k, v in key)}) ...",
+                  flush=True)
+            inputs[key] = (dm, {k: v.unsqueeze(0).to(args.device) for k, v in ds[0].items()})
+        return inputs[key]
+
+    # Target, persistence and the optical-flow baseline come from the first
+    # checkpoint's inputs; the target is nearest-neighbour under every setting.
+    datamodule, batch = inputs_for(ckpts[0])
     target_spec = datamodule.sources["target_2km"]
 
     lead_times = [int(x) for x in args.lead_times.split(",")]
@@ -424,13 +449,6 @@ def main() -> None:
     if bad:
         raise SystemExit(f"--mass-thresholds {bad} are not bucket boundaries {BUCKET_EDGES}")
 
-    dataset = RainPro8Dataset(
-        data_root=data_root,
-        sources=datamodule.sources,
-        init_times=[init_time],
-        jitter_km=0.0,  # inference: no augmentation, canvas centred as configured
-        variable_aliases=variable_aliases,
-    )
     # Persistence: a separate single-source Dataset reading the target at t0.
     # Same spec name/store as target_2km, so identical 2 km grid, no-echo and
     # missing handling, and raw (unnormalized) dBZ.
@@ -442,8 +460,6 @@ def main() -> None:
         variable_aliases=variable_aliases,
     )
 
-    print(f"building input sample for {init_time} ...", flush=True)
-    batch = {k: v.unsqueeze(0).to(args.device) for k, v in dataset[0].items()}
     truth = batch["target_2km"][0, lead_idx, 0].cpu().numpy()  # (n_lead, H, W), NaN where missing
     if np.isnan(truth).all():
         print("!! ground truth is entirely NaN -- QPESUMS has no coverage for this init_time")
@@ -467,9 +483,10 @@ def main() -> None:
     for ckpt in ckpts:
         ckpt_label = os.path.splitext(os.path.basename(ckpt))[0]
         print(f"\nrunning {ckpt} on {args.device} ...", flush=True)
-        module = load_module(ckpt, datamodule, args.device)
+        ckpt_dm, ckpt_batch = inputs_for(ckpt)
+        module = load_module(ckpt, ckpt_dm, args.device)
         with torch.no_grad():
-            out = module(batch, EvalRequest(need_forecast=True, need_probs=True))
+            out = module(ckpt_batch, EvalRequest(need_forecast=True, need_probs=True))
         del module
         assert out.probs is not None
 

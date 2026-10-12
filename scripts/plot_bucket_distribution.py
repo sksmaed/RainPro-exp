@@ -59,7 +59,7 @@ from infer_visualize import (  # noqa: E402
     pick_points,
 )
 from rainpro.data.rainpro8_dataset import RainPro8Dataset  # noqa: E402
-from rainpro.data.rainpro8_datamodule import RainPro8DataModule  # noqa: E402
+from rainpro.data.rainpro8_datamodule import RainPro8DataModule, downsample_from_checkpoint  # noqa: E402
 from rainpro.modules.utils import EvalRequest  # noqa: E402
 
 MODEL_BLUE = "#1878A8"
@@ -215,6 +215,8 @@ def main() -> None:
     init_time = np.datetime64(args.init_time)
 
     # Only for `sources` / `frames_out`; no setup(), as in infer_visualize.py.
+    # Inputs resampled the way the checkpoint was trained (see
+    # `downsample_from_checkpoint`).
     datamodule = RainPro8DataModule(
         data_root=data_root,
         start_date="2021-01-01",
@@ -222,6 +224,7 @@ def main() -> None:
         include_satellite=args.include_satellite,
         include_gfs=args.include_gfs,
         variable_aliases=variable_aliases,
+        **downsample_from_checkpoint(ckpt),
     )
     leads = list(datamodule.sources["target_2km"].offsets_min)
     if args.lead not in leads:

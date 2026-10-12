@@ -29,7 +29,14 @@ from torch.utils.data import Dataset
 
 from rainpro.data import sta_h8_raw
 from rainpro.data.normalize import DEFAULT_NORM_BOUNDS, minmax_normalize
-from rainpro.data.regrid import NearestNeighborRegridder, RegridMapping, target_grid
+from rainpro.data.regrid import (
+    AggregationMapping,
+    NearestNeighborRegridder,
+    RegridMapping,
+    aggregate,
+    prepare_aggregation,
+    target_grid,
+)
 from rainpro.data.rainpro8_sources import SourceSpec
 
 # Which zarr store (key into `data_root`) each source is read from.
@@ -240,6 +247,14 @@ class RainPro8Dataset(Dataset):
 
         self._datasets: dict[str, xr.Dataset] = {}
         self._regridders: dict[str, NearestNeighborRegridder] = {}
+        # Source (lat, lon) per store, for area aggregation (`SourceSpec.
+        # downsample` != "nearest"), and a small cache of the resulting
+        # mappings: with no jitter every sample shares one canvas, so the
+        # per-pixel cell assignment is computed once per source instead of
+        # once per sample (with jitter the centre differs every sample and the
+        # cache just turns over).
+        self._latlon: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._agg_cache: "OrderedDict[tuple, AggregationMapping]" = OrderedDict()
         # Per-worker LRU cache of *pre-regrid* (store_key, raw_name, resolved
         # timestamp) -> raw (masked) ndarray, keyed on the timestamp actually
         # resolved by `.sel(..., method="nearest")` rather than the query time,
@@ -354,6 +369,7 @@ class RainPro8Dataset(Dataset):
                 else DEFAULT_LATLON_CANDIDATES
             )
             lat, lon = _extract_latlon(handle.primary, candidates)
+            self._latlon[store_key] = (lat, lon)
             self._regridders[store_key] = NearestNeighborRegridder(
                 lat, lon, ref_lat=self.center_lat
             )
@@ -390,6 +406,11 @@ class RainPro8Dataset(Dataset):
             # for radar_4km's, 2x for satellite_8km's. See `RegridMapping`'s
             # docstring in rainpro/data/regrid.py.
             mapping = regridder.prepare(dst_lat, dst_lon)
+            agg = (
+                None
+                if spec.downsample == "nearest"
+                else self._aggregation(store_key, center_lat, center_lon, spec)
+            )
 
             is_target = name == "target_2km"
             # (T, C, H, W). GT is raw QPESUMS max dBZ (see
@@ -405,11 +426,41 @@ class RainPro8Dataset(Dataset):
                 init_time,
                 keep_nan=is_target,
                 normalize=not is_target,
+                agg=agg,
             )
 
             sample[name] = torch.from_numpy(arr).float()
 
         return sample
+
+    def _aggregation(
+        self, store_key: str, center_lat: float, center_lon: float, spec: SourceSpec
+    ) -> AggregationMapping:
+        key = (store_key, center_lat, center_lon, spec.size_km, spec.resolution_km)
+        cached = self._agg_cache.get(key)
+        if cached is not None:
+            self._agg_cache.move_to_end(key)
+            return cached
+        lat, lon = self._latlon[store_key]
+        agg = prepare_aggregation(lat, lon, center_lat, center_lon, spec.size_km, spec.resolution_km)
+        self._agg_cache[key] = agg
+        if len(self._agg_cache) > 8:
+            self._agg_cache.popitem(last=False)
+        return agg
+
+    def _resample(
+        self,
+        data: np.ndarray,
+        regridder: NearestNeighborRegridder,
+        mapping: RegridMapping,
+        agg: AggregationMapping | None,
+        spec: SourceSpec,
+    ) -> np.ndarray:
+        """Source grid -> this spec's canvas, per `spec.downsample`. Both paths
+        return NaN for cells with no source data (outside coverage)."""
+        if agg is None:
+            return regridder.apply(data, mapping, fill_value=np.nan)
+        return aggregate(data, agg, spec.downsample)
 
     def _cache_put(self, key: tuple, value: np.ndarray) -> None:
         self._frame_cache[key] = value
@@ -483,6 +534,7 @@ class RainPro8Dataset(Dataset):
         init_time: np.datetime64,
         keep_nan: bool = False,
         normalize: bool = True,
+        agg: AggregationMapping | None = None,
     ) -> np.ndarray:
         """Returns (T, C, H, W) for one source: every offset in
         `spec.offsets_min`, every channel, regridded onto `mapping`.
@@ -552,7 +604,7 @@ class RainPro8Dataset(Dataset):
                     per_var_frames[var_idx][slot], spec.no_echo_values, spec.no_echo_fill
                 )
                 data = _mask_missing(data, spec.missing_values)
-                regridded = regridder.apply(data, mapping, fill_value=np.nan)
+                regridded = self._resample(data, regridder, mapping, agg, spec)
                 if normalize:
                     regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
                 out[t_idx, channel] = regridded
@@ -564,7 +616,7 @@ class RainPro8Dataset(Dataset):
                     data[list(spec.levels)], spec.no_echo_values, spec.no_echo_fill
                 )
                 data = _mask_missing(data, spec.missing_values)
-                regridded = regridder.apply(data, mapping, fill_value=np.nan)
+                regridded = self._resample(data, regridder, mapping, agg, spec)
                 if normalize:
                     regridded = minmax_normalize(regridded, self.norm_bounds.get(var))
                 out[t_idx, channel : channel + n_levels] = regridded

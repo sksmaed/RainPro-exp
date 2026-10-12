@@ -131,6 +131,7 @@ class AggregationMapping:
     cell: np.ndarray  # flat destination cell index per *kept* source pixel
     keep: np.ndarray  # flat bool over the source grid: pixel lies inside the canvas
     dst_shape: tuple[int, int]
+    src_shape: tuple[int, ...]
 
 
 def prepare_aggregation(
@@ -154,35 +155,52 @@ def prepare_aggregation(
     col = np.floor((src_lon - center_lon) * km_per_deg_lon / resolution_km + n / 2).ravel()
     keep = (row >= 0) & (row < n) & (col >= 0) & (col < n)
     cell = (row[keep] * n + col[keep]).astype(np.int64)
-    return AggregationMapping(cell=cell, keep=keep, dst_shape=(n, n))
+    return AggregationMapping(cell=cell, keep=keep, dst_shape=(n, n), src_shape=src_lat.shape)
+
+
+AGGREGATIONS = ("mean", "zmean", "max")
 
 
 def aggregate(src_data: np.ndarray, mapping: AggregationMapping, how: str) -> np.ndarray:
-    """Reduce a (*src_shape) dBZ field onto `mapping`'s cells. NaN source
-    pixels are ignored; a cell with no finite source pixel is NaN.
+    """Reduce a (..., *src_shape) field onto `mapping`'s cells, returning
+    (..., *dst_shape); leading dims (e.g. levels) are reduced independently.
+    NaN source pixels are ignored; a cell with no finite source pixel is NaN.
 
-      * "zmean": mean in linear reflectivity Z = 10**(dBZ/10), back to dBZ.
-        Averaging dBZ directly would average logarithms, i.e. a geometric mean
-        of Z that under-weights strong echo.
+      * "mean": plain average of every source pixel in the cell -- right for
+        linear quantities such as brightness temperature.
+      * "zmean": for reflectivity in dBZ: mean in linear Z = 10**(dBZ/10),
+        back to dBZ. Averaging dBZ directly averages logarithms, i.e. takes a
+        geometric mean of Z that under-weights strong echo: a cell half 0 and
+        half 40 dBZ is 20 dBZ by "mean" but ~37 dBZ by "zmean".
       * "max": the strongest pixel in the cell (keeps convective core peaks,
         which "zmean" dilutes by the core's share of the cell area).
     """
-    values = src_data.ravel()[mapping.keep]
+    if how not in AGGREGATIONS:
+        raise ValueError(f"how must be one of {AGGREGATIONS}, got {how!r}")
+    src_ndim = len(mapping.src_shape)
+    lead_shape = src_data.shape[: src_data.ndim - src_ndim]
+    flat = src_data.reshape(-1, mapping.keep.size)
+    out = np.stack([_aggregate_2d(layer, mapping, how) for layer in flat])
+    return out.reshape(*lead_shape, *mapping.dst_shape)
+
+
+def _aggregate_2d(layer: np.ndarray, mapping: AggregationMapping, how: str) -> np.ndarray:
+    values = layer[mapping.keep]
     finite = np.isfinite(values)
     cell = mapping.cell[finite]
     values = values[finite]
     n_cells = mapping.dst_shape[0] * mapping.dst_shape[1]
     count = np.bincount(cell, minlength=n_cells)
 
-    if how == "zmean":
-        z_sum = np.bincount(cell, weights=10.0 ** (values / 10.0), minlength=n_cells)
-        with np.errstate(divide="ignore", invalid="ignore"):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if how == "mean":
+            out = np.bincount(cell, weights=values, minlength=n_cells) / count
+        elif how == "zmean":
+            z_sum = np.bincount(cell, weights=10.0 ** (values / 10.0), minlength=n_cells)
             out = 10.0 * np.log10(z_sum / count)
-    elif how == "max":
-        out = np.full(n_cells, -np.inf)
-        np.maximum.at(out, cell, values)
-    else:
-        raise ValueError(f"how must be 'zmean' or 'max', got {how!r}")
+        else:  # max
+            out = np.full(n_cells, -np.inf)
+            np.maximum.at(out, cell, values)
 
     out[count == 0] = np.nan
     return out.reshape(mapping.dst_shape).astype(np.float32)

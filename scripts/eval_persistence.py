@@ -51,7 +51,7 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rainpro.baselines.optical_flow import OpticalFlowBaseline  # noqa: E402
-from rainpro.data.rainpro8_datamodule import RainPro8DataModule  # noqa: E402
+from rainpro.data.rainpro8_datamodule import RainPro8DataModule, downsample_from_checkpoint  # noqa: E402
 from rainpro.data.rainpro8_dataset import RainPro8Dataset  # noqa: E402
 from rainpro.loss.ordinal_consistent import taiwan_dbz_buckets  # noqa: E402
 from rainpro.metrics.contingency import ContingencyMetrics  # noqa: E402
@@ -101,6 +101,15 @@ def load_datamodule(args) -> RainPro8DataModule:
         cfg["variable_aliases"] = json.loads(args.variable_aliases)
     cfg["num_workers"] = args.num_workers
     cfg["batch_size"] = cfg["eval_batch_size"] = args.batch_size
+    # Inputs must be resampled the way the checkpoint was trained, whatever the
+    # config passed in says (e.g. rainpro8.yml's current setting with an older
+    # nearest-neighbour checkpoint).
+    trained = downsample_from_checkpoint(args.ckpt)
+    for key, value in trained.items():
+        if cfg.get(key, "nearest") != value:
+            print(f"!! {key}: config says {cfg.get(key, 'nearest')!r}, checkpoint was trained with "
+                  f"{value!r} -- using {value!r}")
+    cfg.update(trained)
     return RainPro8DataModule(**cfg)
 
 
