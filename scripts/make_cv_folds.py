@@ -13,11 +13,32 @@ partition. The data module additionally keeps `cv_gap_hours` between roles
 `manifest_splits`), enforced per fold.
 
 Balancing. Blocks are stratified by season (typhoon blocks are their own
-stratum). Within a stratum, blocks are taken in order of decreasing echo
-(mean coverage >= 20 dBZ), a round of len(partitions) at a time, and in each
-round every partition receives one block -- the partition with the fewest
-samples so far picks first. So every partition gets a similar share of each
-season, of wet and dry blocks, and of samples.
+stratum); strata are dealt heaviest-echo first so later ones can even out what
+the heavy ones leave. Within a stratum, blocks are taken in order of
+decreasing echo (mean coverage >= 20 dBZ), a round of len(partitions) at a
+time, and in each round every partition receives one block -- the partition
+with the least accumulated echo mass (coverage x samples) picks first. One
+block per partition per round keeps sample counts and season shares close;
+picking by echo mass keeps a few very wet blocks (a typhoon, a south-westerly
+flow event) from piling up in one fold.
+
+That greedy deal alone still leaves the partitions that drew a typhoon
+noticeably wetter (one block per partition per round can't compensate), so it
+is refined by local search: repeatedly swap two blocks of the SAME stratum
+between partitions and keep the swap if the balance score drops. Same-stratum
+swaps never change how many blocks of each season a partition holds. Done
+from `--tries` random starts, `--swaps` attempts each; the best split wins.
+
+Balance score (lower = more even): coefficient of variation across
+partitions of mean coverage >= 20 dBZ, of mean coverage >= 35 dBZ and of
+sample count, plus 5 x the mean absolute deviation of season shares from the
+pool's. It uses only the pool's own statistics -- never model results -- so
+searching over it leaks nothing.
+
+`--typhoon-in-test` reserves one typhoon block (chosen per seed) for the
+test partition, so the final test score includes a typhoon; the other typhoon
+blocks then go to CV folds only. Off by default: with few typhoons, each one
+given to test is one fewer for training and validation.
 
 Partitions: fold0 .. fold{K-1}, plus "test" unless `--no-test`. The test
 partition is NOT part of cross-validation: with K folds and a test partition,
@@ -52,27 +73,90 @@ def assign_blocks(pool: pd.DataFrame, block_days: int) -> pd.Series:
     return block.where(typhoon == "", "ty_" + typhoon)
 
 
-def assign_partitions(blocks: pd.DataFrame, partitions: list[str], seed: int) -> dict[str, str]:
+def assign_partitions(
+    blocks: pd.DataFrame, partitions: list[str], seed: int, typhoon_in_test: bool
+) -> dict[str, str]:
     """blocks: one row per block with columns n, stratum, echo. Returns
     block -> partition. See module docstring for the rule."""
     rng = np.random.default_rng(seed)
-    size = dict.fromkeys(partitions, 0)
+    mass = dict.fromkeys(partitions, 0.0)  # accumulated sum of coverage x samples
     out: dict[str, str] = {}
-    for _, group in blocks.groupby("stratum", sort=True):
+
+    def give(name: str, part: str) -> None:
+        out[name] = part
+        mass[part] += float(blocks.loc[name, "echo"] * blocks.loc[name, "n"])
+
+    typhoons = list(blocks.index[blocks["stratum"] == "typhoon"])
+    if typhoon_in_test and "test" in partitions and typhoons:
+        give(typhoons[int(rng.integers(len(typhoons)))], "test")
+
+    blocks = blocks.assign(mass=blocks["echo"] * blocks["n"])
+    order = blocks.groupby("stratum")["mass"].sum().sort_values(ascending=False).index
+    for stratum in order:
+        group = blocks[(blocks["stratum"] == stratum) & ~blocks.index.isin(list(out))]
         # Shuffle first so equal-echo blocks don't always fall in date order.
         group = group.sample(frac=1.0, random_state=int(rng.integers(2**31))).sort_values(
             "echo", ascending=False, kind="stable"
         )
+        eligible = [p for p in partitions if not (typhoon_in_test and stratum == "typhoon" and p == "test")]
         names = list(group.index)
-        for start in range(0, len(names), len(partitions)):
-            free = list(partitions)
-            rng.shuffle(free)  # tie-break among equally sized partitions
-            for name in names[start:start + len(partitions)]:
-                pick = min(free, key=lambda p: size[p])
+        for start in range(0, len(names), len(eligible)):
+            free = list(eligible)
+            rng.shuffle(free)  # tie-break among equal masses
+            for name in names[start:start + len(eligible)]:
+                pick = min(free, key=lambda p: mass[p])
                 free.remove(pick)
-                out[name] = pick
-                size[pick] += int(group.loc[name, "n"])
+                give(name, pick)
     return out
+
+
+class Balance:
+    """Fast balance score for a block -> partition-index assignment (see
+    module docstring)."""
+
+    def __init__(self, blocks: pd.DataFrame, season_counts: pd.DataFrame, n_parts: int):
+        self.k = n_parts
+        self.n = blocks["n"].to_numpy(float)
+        self.m20 = (blocks["echo"] * blocks["n"]).to_numpy(float)
+        self.m35 = (blocks["echo35"] * blocks["n"]).to_numpy(float)
+        self.seasons = season_counts.to_numpy(float)
+        self.overall = self.seasons.sum(axis=0) / self.seasons.sum()
+
+    def stats(self, a: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        n = np.bincount(a, weights=self.n, minlength=self.k)
+        c20 = np.bincount(a, weights=self.m20, minlength=self.k) / n
+        c35 = np.bincount(a, weights=self.m35, minlength=self.k) / n
+        shares = np.stack([np.bincount(a, weights=col, minlength=self.k) for col in self.seasons.T], axis=1)
+        return n, c20, c35, shares / shares.sum(axis=1, keepdims=True)
+
+    def __call__(self, a: np.ndarray) -> float:
+        n, c20, c35, shares = self.stats(a)
+
+        def cv(x: np.ndarray) -> float:
+            return float(x.std() / x.mean()) if x.mean() else 0.0
+
+        return cv(c20) + cv(c35) + cv(n) + 5 * float(np.abs(shares - self.overall).mean())
+
+
+def local_search(a: np.ndarray, strata: np.ndarray, score: Balance, swaps: int,
+                 rng: np.random.Generator) -> tuple[np.ndarray, float]:
+    """Swap same-stratum blocks between partitions while the score improves."""
+    a = a.copy()
+    best = score(a)
+    groups = [np.flatnonzero(strata == s) for s in np.unique(strata)]
+    groups = [g for g in groups if len(g) >= 2]
+    for _ in range(swaps):
+        g = groups[rng.integers(len(groups))]
+        i, j = rng.choice(g, size=2, replace=False)
+        if a[i] == a[j]:
+            continue
+        a[i], a[j] = a[j], a[i]
+        trial = score(a)
+        if trial < best:
+            best = trial
+        else:
+            a[i], a[j] = a[j], a[i]
+    return a, best
 
 
 def main() -> None:
@@ -81,13 +165,17 @@ def main() -> None:
     ap.add_argument("--k", type=int, default=5, help="number of CV folds")
     ap.add_argument("--block-days", type=int, default=3)
     ap.add_argument("--no-test", action="store_true", help="no held-out test partition (CV folds only)")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0, help="first seed tried")
+    ap.add_argument("--tries", type=int, default=20, help="random starts; the best-balanced split is kept")
+    ap.add_argument("--swaps", type=int, default=20000, help="local-search swap attempts per start")
+    ap.add_argument("--typhoon-in-test", action="store_true",
+                     help="reserve one typhoon block for the test partition")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.k < 2:
         raise SystemExit("--k must be at least 2")
 
-    pool = pd.read_csv(args.pool, parse_dates=["init_time", "local_time"])
+    pool = pd.read_csv(args.pool, parse_dates=["init_time", "local_time"], dtype={"typhoon": str})
     pool["typhoon"] = pool["typhoon"].fillna("")
     pool["block"] = assign_blocks(pool, args.block_days)
 
@@ -96,15 +184,36 @@ def main() -> None:
         season=("season", lambda s: s.mode().iloc[0]),
         typhoon=("typhoon", "first"),
         echo=("cov20_target", "mean"),
+        echo35=("cov35_target", "mean"),
         start=("local_time", "min"),
     )
+    season_counts = pd.crosstab(pool["block"], pool["season"]).reindex(blocks.index)
     blocks["stratum"] = np.where(blocks["typhoon"] != "", "typhoon", blocks["season"])
 
     partitions = [f"fold{i}" for i in range(args.k)] + ([] if args.no_test else ["test"])
     if len(blocks) < len(partitions):
         raise SystemExit(f"only {len(blocks)} blocks for {len(partitions)} partitions -- "
                          "lower --block-days or --k")
-    mapping = assign_partitions(blocks, partitions, args.seed)
+    score = Balance(blocks, season_counts, len(partitions))
+    index = {p: i for i, p in enumerate(partitions)}
+    strata = blocks["stratum"].to_numpy()
+    if args.typhoon_in_test:
+        # Keep exactly one typhoon in test: typhoon swaps then only trade which one.
+        strata = np.where(strata == "typhoon", "typhoon", strata)
+    best = None
+    for seed in range(args.seed, args.seed + args.tries):
+        greedy = assign_partitions(blocks, partitions, seed, args.typhoon_in_test)
+        start_a = np.array([index[greedy[b]] for b in blocks.index])
+        greedy_score = score(start_a)
+        a, s_ = local_search(start_a, strata, score, args.swaps, np.random.default_rng(seed))
+        if best is None or s_ < best[0]:
+            best = (s_, seed, a, greedy_score)
+    final, seed, a, greedy_score = best
+    mapping = {b: partitions[i] for b, i in zip(blocks.index, a)}
+    n, c20, c35, _ = score.stats(a)
+    print(f"best of {args.tries} starts: seed {seed}, balance score {greedy_score:.3f} (greedy) -> {final:.3f}"
+          f"  | mean cov20 {c20.min():.3f}-{c20.max():.3f}, cov35 {c35.min():.4f}-{c35.max():.4f},"
+          f" samples {int(n.min()):,}-{int(n.max()):,}")
     pool["partition"] = pool["block"].map(mapping)
     blocks["partition"] = blocks.index.map(mapping)
 

@@ -156,11 +156,12 @@ def manifest_splits(
     Returns (splits, counts) -- counts per role: in pool / dropped by gap /
     dropped by the low-echo filter / used.
     """
-    df = pd.read_csv(manifest_path, parse_dates=["init_time"])
-    missing = {"init_time", "partition", "keep"} - set(df.columns)
+    columns = {"init_time", "partition", "keep"}
+    missing = columns - set(pd.read_csv(manifest_path, nrows=0).columns)
     if missing:
         raise ValueError(f"{manifest_path}: missing columns {sorted(missing)} -- build it with "
                          "scripts/build_sample_pool.py then scripts/make_cv_folds.py")
+    df = pd.read_csv(manifest_path, usecols=sorted(columns), parse_dates=["init_time"])
     val_name = f"fold{cv_fold}"
     if val_name not in set(df["partition"]):
         raise ValueError(f"cv_fold={cv_fold}: no partition {val_name!r} in {manifest_path} "
