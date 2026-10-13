@@ -206,6 +206,9 @@ def build_datamodule(ckpt_path: str, args) -> RainPro8DataModule:
                    .get("datamodule_hyper_parameters") or {})
     if not hparams:
         sys.exit(f"{ckpt_path} has no datamodule_hyper_parameters")
+    # Keys starting with "_" (e.g. jsonargparse's `_instantiator`) are
+    # bookkeeping, not datamodule settings.
+    hparams = {k: v for k, v in hparams.items() if not k.startswith("_")}
     accepted = set(inspect.signature(RainPro8DataModule.__init__).parameters) - {"self"}
     dropped = {k: v for k, v in hparams.items() if k not in accepted and v not in (None, "nearest")}
     if dropped:
