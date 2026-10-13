@@ -167,7 +167,7 @@ class ThresholdStats:
         add("event_rate", self.event_n / valid_n)
         brier = self.brier.sum_sq.double() / self.brier.count.double().clamp(min=1)
         add("brier", brier)
-        gaps = _bucket_gaps_mmh(_bucket_edges_dbz()).double().view(-1, 1)
+        gaps = _bucket_gaps_mmh(_bucket_edges_dbz()).double().view(-1, 1).to(brier.device)
         add("crps_contrib", gaps * brier)
         rel = self.reliability
         add("mean_prob", 1 - rel.sum_pred.double().sum(-1) / rel.count.double().sum(-1).clamp(min=1))
